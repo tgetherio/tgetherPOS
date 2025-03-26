@@ -64,19 +64,33 @@ contract PoSTest is Test {
     }
 
     // Helper function to access internal state (optional but helpful)
-    function getOrderInfo(string memory _vendorID, string memory _orderID) 
-        internal view returns (
-            string memory, uint256, uint256, bool
-        ) {
-        PoS.Vendor storage vendor = pos.vendors(_vendorID);
-        PoS.Order storage order = vendor.orders[_orderID];
-        return (
-            order.orderID,
-            order.currentAmount,
-            order.totalAmount,
-            order.processed
-        );
+    // function getOrderInfo(string memory _vendorID, string memory _orderID) 
+    //     internal view returns (
+    //         string memory, uint256, uint256, bool
+    //     ) {
+    //     PoS.Vendor storage vendor = pos.vendors(_vendorID);
+    //     PoS.Order storage order = vendor.orders[_orderID];
+    //     return (
+    //         order.orderID,
+    //         order.currentAmount,
+    //         order.totalAmount,
+    //         order.processed
+    //     );
+    // }
+
+    function getOrderInfo(string memory _vendorID, string memory _orderID)
+        internal
+        view
+        returns (
+            string memory orderID,
+            uint256 currentAmount,
+            uint256 totalAmount,
+            bool processed
+        )
+    {
+        return pos.getOrderInfo(_vendorID, _orderID);
     }
+
 
     // Allow the test contract to send ETH
     receive() external payable {}

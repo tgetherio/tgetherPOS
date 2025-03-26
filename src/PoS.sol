@@ -119,6 +119,29 @@ contract PoS {
         approvedAddresses[addr] = false;
     }
 
+    // Helper function to access internal state
+    function getOrderInfo(
+        string memory _vendorID,
+        string memory _orderID
+    ) 
+        external
+        view
+        returns (
+            string memory orderID,
+            uint256 currentAmount,
+            uint256 totalAmount,
+            bool processed
+        )
+    {
+        Order storage order = vendors[_vendorID].orders[_orderID];
+        return (
+            order.orderID,
+            order.currentAmount,
+            order.totalAmount,
+            order.processed
+        );
+    }
+
     // --- Events ---
     event PaymentProcessed(
         string vendorID,
