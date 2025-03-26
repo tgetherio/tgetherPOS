@@ -36,33 +36,46 @@ contract PoSTest is Test {
         uint256 numPayers = 3;
         vm.prank(vendor);
         pos.createOrder("Airbnb", "Order1", totalAmount, numPayers);
-        console.log("Step 2: Order 'Order1' created with total 3 ether for 3 payers");
+        console.log("Step 2: Order created: total=%s, numPayers=%s", totalAmount, numPayers);
 
         // Step 3: Each payer sends their payment (1 ether each)
         uint256 expectedAmount = totalAmount / numPayers; // 1 ether
+        console.log("Vendor balance before payments: %s", vendor.balance);
 
+        // Payer1 pays
         vm.prank(payer1);
         pos.pay{value: expectedAmount}("Airbnb", "Order1", payer1, 1);
-        console.log("Step 3a: Payer1 sent 1 ether");
+        (uint256 t1, uint256 c1, bool p1, ) = pos.getOrderDetails("Airbnb", "Order1");
+        console.log("Step 3a: After Payer1: total=%s, current=%s, processed=%s", t1, c1, p1);
 
+        // Payer2 pays
         vm.prank(payer2);
         pos.pay{value: expectedAmount}("Airbnb", "Order1", payer2, 1);
-        console.log("Step 3b: Payer2 sent 1 ether");
+        (uint256 t2, uint256 c2, bool p2, ) = pos.getOrderDetails("Airbnb", "Order1");
+        console.log("Step 3b: After Payer2: total=%s, current=%s, processed=%s", t2, c2, p2);
 
+        // Payer3 pays with debugging
         vm.prank(payer3);
-        pos.pay{value: expectedAmount}("Airbnb", "Order1", payer3, 1);
-        console.log("Step 3c: Payer3 sent 1 ether");
+        try pos.pay{value: expectedAmount}("Airbnb", "Order1", payer3, 1) {
+            console.log("Step 3c: Payer3 payment succeeded");
+        } catch Error(string memory reason) {
+            console.log("Step 3c: Payer3 payment reverted with reason: %s", reason);
+            assertTrue(false, "Payer3 payment should not revert");
+        } catch {
+            console.log("Step 3c: Payer3 payment reverted without reason");
+            assertTrue(false, "Payer3 payment should not revert");
+        }
 
-        // Step 4: Verify the order is processed
-        (uint256 orderTotal, uint256 currentAmount, bool processed, uint256 orderNumPayers) = pos.getOrderDetails("Airbnb", "Order1");
+        // Step 4: Verify the final state
+        (uint256 orderTotal, uint256 currentAmount, bool processed, ) = pos.getOrderDetails("Airbnb", "Order1");
+        console.log("Step 4: Final state: total=%s, current=%s, processed=%s", orderTotal, currentAmount, processed);
         assertEq(orderTotal, 0, "Total amount should be reset after processing");
         assertEq(currentAmount, 3 ether, "Current amount should be 3 ether");
         assertTrue(processed, "Order should be marked as processed");
-        console.log("Step 4: Order processed, total 3 ether collected");
 
-        // Step 5: Verify the vendor received the payment
+        // Step 5: Verify vendor received payment
+        console.log("Vendor balance after processing: %s", vendor.balance);
         assertEq(vendor.balance, 3 ether, "Vendor should have received 3 ether");
-        console.log("Step 5: Vendor received 3 ether");
 
         // Step 6: Verify contributions are tracked correctly
         PoS.Contribution[] memory contributions = pos.getContributions("Airbnb", "Order1");
@@ -81,16 +94,16 @@ contract PoSTest is Test {
         vm.prank(vendor);
         pos.createVendor("Airbnb");
         vm.prank(vendor);
-        pos.createOrder("Airbnb", "Order2", 3 ether, 3);
+        pos.createOrder("Airbnb", "Order1", 3 ether, 3);
 
         vm.prank(payer1);
         vm.expectRevert("Incorrect payment amount");
-        pos.pay{value: 0.5 ether}("Airbnb", "Order2", payer1, 1);
+        pos.pay{value: 0.5 ether}("Airbnb", "Order1", payer1, 1);
         console.log("Test: Payment of 0.5 ether (less than expected) reverted");
 
         vm.prank(payer1);
         vm.expectRevert("Incorrect payment amount");
-        pos.pay{value: 1.5 ether}("Airbnb", "Order2", payer1, 1);
+        pos.pay{value: 1.5 ether}("Airbnb", "Order1", payer1, 1);
         console.log("Test: Payment of 1.5 ether (more than expected) reverted");
     }
 
@@ -99,14 +112,14 @@ contract PoSTest is Test {
         vm.prank(vendor);
         pos.createVendor("Airbnb");
         vm.prank(vendor);
-        pos.createOrder("Airbnb", "Order3", 3 ether, 3);
+        pos.createOrder("Airbnb", "Order1", 3 ether, 3);
 
         vm.prank(payer1);
-        pos.pay{value: 1 ether}("Airbnb", "Order3", payer1, 1);
+        pos.pay{value: 1 ether}("Airbnb", "Order1", payer1, 1);
 
         vm.prank(payer1);
         vm.expectRevert("Already paid");
-        pos.pay{value: 1 ether}("Airbnb", "Order3", payer1, 1);
+        pos.pay{value: 1 ether}("Airbnb", "Order1", payer1, 1);
         console.log("Test: Second payment from Payer1 reverted");
     }
 
@@ -115,18 +128,18 @@ contract PoSTest is Test {
         vm.prank(vendor);
         pos.createVendor("Airbnb");
         vm.prank(vendor);
-        pos.createOrder("Airbnb", "Order4", 3 ether, 3);
+        pos.createOrder("Airbnb", "Order1", 3 ether, 3);
 
         vm.prank(payer1);
-        pos.pay{value: 1 ether}("Airbnb", "Order4", payer1, 1);
+        pos.pay{value: 1 ether}("Airbnb", "Order1", payer1, 1);
         vm.prank(payer2);
-        pos.pay{value: 1 ether}("Airbnb", "Order4", payer2, 1);
+        pos.pay{value: 1 ether}("Airbnb", "Order1", payer2, 1);
         vm.prank(payer3);
-        pos.pay{value: 1 ether}("Airbnb", "Order4", payer3, 1);
+        pos.pay{value: 1 ether}("Airbnb", "Order1", payer3, 1);
 
         vm.prank(payer1);
         vm.expectRevert("Order already processed");
-        pos.pay{value: 1 ether}("Airbnb", "Order4", payer1, 1);
+        pos.pay{value: 1 ether}("Airbnb", "Order1", payer1, 1);
         console.log("Test: Payment after order processed reverted");
     }
 
