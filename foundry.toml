@@ -12,4 +12,3 @@ remappings = [
   '@chainlink/contracts-ccip/=node_modules/@chainlink/contracts-ccip',
   '@chainlink/local=node_modules/@chainlink/local',
 ]
-dependencies = ["OpenZeppelin/openzeppelin-contracts"]
