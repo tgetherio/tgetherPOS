@@ -2,7 +2,7 @@
 pragma solidity ^0.8.13;
 
 import {Test, console} from "forge-std/Test.sol";
-import {PoS} from "../src/PoS.sol";
+import "../src/PoS.sol";
 
 contract PoSTest is Test {
     // Contract instance
