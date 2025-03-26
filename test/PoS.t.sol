@@ -31,7 +31,7 @@ contract PoSTest is Test {
         pos.createVendor(vendorID);
 
         // Explicitly declare payees array (2 payees)
-        PoS.Payee ;
+        PoS.Payee[] memory payees = new PoS.Payee[](2);
         payees[0] = PoS.Payee(user1, 1 ether, payAsChain, false);
         payees[1] = PoS.Payee(user2, 1 ether, payAsChain, false);
 
