@@ -4,3 +4,12 @@ out = "out"
 libs = ["lib"]
 
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options
+remappings = [
+  'forge-std/=lib/forge-std/src',
+  '@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/',
+  '@openzeppelin/contracts-upgradeable/=lib/openzeppelin-contracts-upgradeable/contracts/',
+  '@chainlink/contracts/=node_modules/@chainlink/contracts',
+  '@chainlink/contracts-ccip/=node_modules/@chainlink/contracts-ccip',
+  '@chainlink/local=node_modules/@chainlink/local',
+]
+dependencies = ["OpenZeppelin/openzeppelin-contracts"]

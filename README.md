@@ -14,6 +14,11 @@ Foundry consists of:
 https://book.getfoundry.sh/
 
 ## Usage
+```shell
+$ forge install
+$ npm install
+
+```
 
 ### Build
 
