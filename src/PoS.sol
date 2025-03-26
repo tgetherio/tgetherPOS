@@ -1,7 +1,9 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.28;
 
-contract PoS {
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+contract PoS is ReentrancyGuard {
 
 
     // --- Storage Structures ---
@@ -12,27 +14,32 @@ contract PoS {
     }
 
     struct Vendor {
-        string vendorID;                // Unique vendor identifier
+        uint256 vendorID;                // Unique vendor identifier
+        string name;
         address payable vendorAddress;  // Address to receive funds
-        mapping(string => Order) orders;
+        mapping(uint256 => Order) orders;
         bool exists;
     }
 
     struct Order {
-        string orderID;           // Unique order identifier
+        uint256 orderID;           // Unique order identifier
         uint256 totalAmount;      // Total amount to collect
         uint256 currentAmount;    // Amount collected so far
         uint256 numPayers;        // Expected number of payers (for even division)
         mapping(address => uint256) contributions; // Tracks individual contributions
         Contribution[] contributionList; // List of all contributions
         bool processed;           // Whether the order is fully paid and processed
+        bool refunded;            // Whether the order was refunded
     }
 
+    // Global counters
+    uint256 public nextVendorID = 1;
+    uint256 public nextOrderID = 1;
 
     // --- Main Storage Variables ---
-    string[] public vendorList;               // Array to track all vendor IDs
-    mapping(string => uint256) private vendorIndex; // Maps vendorID to its index in vendorList
-    mapping(string => Vendor) private vendors;      // Maps vendorID to Vendor
+    uint256[] public vendorList;               // Array to track all vendor IDs
+    mapping(uint256 => uint256) private vendorIndex; // Maps vendorID to its index in vendorList
+    mapping(uint256 => Vendor) private vendors;      // Maps vendorID to Vendor
     mapping(address => bool) public approvedAddresses; // Access control for approved addresses
 
     // --- Modifiers ---
@@ -43,7 +50,7 @@ contract PoS {
     }
 
     // ensures vendor exists before proceeding
-    modifier vendorExists(string memory vendorID) {
+    modifier vendorExists(uint256 vendorID) {
         require(vendors[vendorID].exists, "Vendor does not exist");
         _;
     }
@@ -57,19 +64,21 @@ contract PoS {
 
 
     // --- Vendor Management ---
-    function createVendor(string calldata vendorID) external onlyApproved {
+    function createVendor(string calldata name) external onlyApproved {
+        uint256 vendorID = nextVendorID++;
         Vendor storage vendor = vendors[vendorID];
         require(!vendor.exists, "Vendor already exists");
         vendor.vendorID = vendorID;
+        vendor.name = name;
         vendor.vendorAddress = payable(msg.sender); // Vendor’s payout address
         vendor.exists = true;
         vendorList.push(vendorID);
         vendorIndex[vendorID] = vendorList.length - 1;
     }
 
-    function deleteVendor(string calldata vendorID) external onlyApproved vendorExists(vendorID) {
+    function deleteVendor(uint256 vendorID) external onlyApproved vendorExists(vendorID) {
         uint256 index = vendorIndex[vendorID];
-        string memory lastVendorID = vendorList[vendorList.length - 1];
+        uint256 lastVendorID = vendorList[vendorList.length - 1];
         vendorList[index] = lastVendorID;
         vendorIndex[lastVendorID] = index;
         vendorList.pop();
@@ -80,14 +89,14 @@ contract PoS {
 
     // --- Order Management ---
     function createOrder(
-        string calldata vendorID,
-        string calldata orderID,
+        uint256 vendorID,
         uint256 totalAmount,
         uint256 numPayers
     ) external onlyApproved vendorExists(vendorID) {
         Vendor storage vendor = vendors[vendorID];
+        uint256 orderID = nextOrderID++;
         Order storage order = vendor.orders[orderID];
-        require(bytes(order.orderID).length == 0, "Order already exists");
+        require(order.orderID == 0, "Order already exists");
         order.orderID = orderID;
         order.totalAmount = totalAmount;
         order.currentAmount = 0;
@@ -98,12 +107,18 @@ contract PoS {
 
     // --- Payment Function (Including Cross-Chain Hooks) ---
     function pay(
-        string calldata vendorID,
-        string calldata orderID,
+        uint256 vendorID,
+        uint256 orderID,
         address payAs,
         uint256 payAsChain
     ) external payable vendorExists(vendorID) {
-        require(msg.sender == payAs, "Must pay as yourself");
+        // Enforce direct payments only
+        require(payAs == address(0) || payAs == msg.sender, "Proxy payments not allowed");
+
+        // Determine contributor and chain ID
+        address contributor = (payAs == address(0)) ? msg.sender : payAs;
+        uint256 chainID = (payAs == address(0)) ? block.chainid : payAsChain;
+
         Vendor storage vendor = vendors[vendorID];
         Order storage order = vendor.orders[orderID];
         require(!order.processed, "Order already processed");
@@ -116,8 +131,8 @@ contract PoS {
         require(order.contributions[payAs] == 0, "Already paid");
 
         // Record contribution
-        order.contributions[payAs] = msg.value;
-        order.contributionList.push(Contribution(payAs, msg.value, payAsChain));
+        order.contributions[contributor] = msg.value;
+        order.contributionList.push(Contribution(contributor, msg.value, chainID));
         order.currentAmount += msg.value;
 
         // Process payment if total is reached
@@ -140,38 +155,52 @@ contract PoS {
         approvedAddresses[addr] = false;
     }
 
-    function refund(string calldata vendorID, string calldata orderID) 
-        external onlyApproved vendorExists(vendorID) {
+    function refund(uint256 vendorID, uint256 orderID) 
+        external onlyApproved vendorExists(vendorID) nonReentrant {
         Vendor storage vendor = vendors[vendorID];
+        require(msg.sender == vendor.vendorAddress, "Only the vendor can initiate refunds");
         Order storage order = vendor.orders[orderID];
         require(!order.processed, "Order already processed");
         require(order.currentAmount > 0, "No funds to refund");
-        uint256 amount = order.currentAmount;
+
+        // Refund each contributor
+        for (uint256 i = 0; i < order.contributionList.length; i++) {
+            Contribution memory contribution = order.contributionList[i];
+            payable(contribution.payer).transfer(contribution.amount);
+        }
+
+        // Reset the order’s current amount
         order.currentAmount = 0;
-        payable(msg.sender).transfer(amount);
+        // Optional: Mark the order as refunded (requires adding a `refunded` bool to the Order struct)
+        order.refunded = true;
     }
 
     // --- Getter Functions ---
-    function getOrderDetails(string calldata vendorID, string calldata orderID)
+    function getOrderDetails(uint256 vendorID, uint256 orderID)
         external view vendorExists(vendorID)
         returns (uint256 totalAmount, uint256 currentAmount, bool processed, uint256 numPayers) {
         Order storage order = vendors[vendorID].orders[orderID];
+        require(order.orderID != 0, "Order does not exist");
         return (order.totalAmount, order.currentAmount, order.processed, order.numPayers);
     }
 
-    function getContributions(string calldata vendorID, string calldata orderID)
+    function getContributions(uint256 vendorID, uint256 orderID)
         external view vendorExists(vendorID)
         returns (Contribution[] memory) {
+        Order storage order = vendors[vendorID].orders[orderID];
+        require(order.orderID != 0, "Order does not exist");
         return vendors[vendorID].orders[orderID].contributionList;
     }
 
 
     // --- Events ---
     event PaymentProcessed(
-        string vendorID,
-        string orderID,
+        uint256 vendorID,
+        uint256 orderID,
         address indexed payAs,
         uint256 indexed payAsChain,
         uint256 totalAmount
     );
+
+    event RefundProcessed(uint256 vendorID, uint256 orderID, uint256 totalRefunded);
 }
