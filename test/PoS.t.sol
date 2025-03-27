@@ -14,6 +14,9 @@ contract PoSTest is Test {
     address public approvedUser;
     address public user3; // used in refund tests
 
+    // Allow receiving Ether in the test contract.
+    receive() external payable {}
+
     function setUp() public {
         // Deploy the PoS contract; the deployer (this contract) is approved by default.
         pos = new PoS();
@@ -36,7 +39,7 @@ contract PoSTest is Test {
     function testOnlyApprovedCanCallFunctions() public {
         // nonApproved address should not be allowed to create a vendor.
         vm.prank(nonApproved);
-        vm.expectRevert("Not an approved address");
+        vm.expectRevert(bytes("Not an approved address"));
         pos.createVendor("NonApprovedVendor");
     }
 
@@ -48,7 +51,7 @@ contract PoSTest is Test {
         // Now remove approval and check that the address can no longer perform restricted actions.
         pos.removeApprovedAddress(approvedUser);
         vm.prank(approvedUser);
-        vm.expectRevert("Not an approved address");
+        vm.expectRevert(bytes("Not an approved address"));
         pos.createVendor("ShouldFail");
     }
 
@@ -68,7 +71,7 @@ contract PoSTest is Test {
         pos.deleteVendor(vendorID);
 
         // Subsequent operations using the vendor should revert.
-        vm.expectRevert("Vendor does not exist");
+        vm.expectRevert(bytes("Vendor does not exist"));
         pos.createOrder(vendorID, 100 ether, 2);
     }
 
@@ -90,21 +93,21 @@ contract PoSTest is Test {
 
     function testCreateOrderFailsForNonExistentVendor() public {
         // Calling createOrder with a vendorID that does not exist should revert.
-        vm.expectRevert("Vendor does not exist");
+        vm.expectRevert(bytes("Vendor does not exist"));
         pos.createOrder(999, 100 ether, 2);
     }
 
     function testGetOrderDetailsFailsForNonExistentOrder() public {
         pos.createVendor("VendorTest");
         uint256 vendorID = 1;
-        vm.expectRevert("Order does not exist");
+        vm.expectRevert(bytes("Order does not exist"));
         pos.getOrderDetails(vendorID, 999);
     }
 
     function testGetContributionsFailsForNonExistentOrder() public {
         pos.createVendor("VendorTest");
         uint256 vendorID = 1;
-        vm.expectRevert("Order does not exist");
+        vm.expectRevert(bytes("Order does not exist"));
         pos.getContributions(vendorID, 999);
     }
 
@@ -131,7 +134,7 @@ contract PoSTest is Test {
         // Payment from user2 should complete the order.
         vm.prank(user2);
         // Expect the PaymentProcessed event to be emitted when order is fully paid.
-        vm.expectEmit(true, true, false, true);
+        vm.expectEmit(true, true, true, true);
         emit PoS.PaymentProcessed(vendorID, 1, user2, block.chainid, orderTotal);
         pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
 
@@ -172,7 +175,7 @@ contract PoSTest is Test {
 
         // A second payment from the same address should revert.
         vm.prank(user1);
-        vm.expectRevert("Already paid");
+        vm.expectRevert(bytes("Already paid"));
         pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
     }
 
@@ -184,7 +187,7 @@ contract PoSTest is Test {
 
         vm.deal(user1, 100 ether);
         vm.prank(user1);
-        vm.expectRevert("Incorrect payment amount");
+        vm.expectRevert(bytes("Incorrect payment amount"));
         pos.pay{value: wrongPayment}(vendorID, 1, address(0), 0);
     }
 
@@ -197,7 +200,7 @@ contract PoSTest is Test {
         vm.deal(user1, 100 ether);
         // Attempt a proxy payment: payAs is non-zero and not equal to msg.sender.
         vm.prank(user1);
-        vm.expectRevert("Proxy payments not allowed");
+        vm.expectRevert(bytes("Proxy payments not allowed"));
         pos.pay{value: expectedPayment}(vendorID, 1, user2, 0);
     }
 
@@ -206,17 +209,16 @@ contract PoSTest is Test {
     //////////////////////////////////////////////////////////////*/
 
     function testRefundProcess() public {
-        // Create a vendor where user1 becomes the vendor payout address.
+        // Approve user1 to create vendor.
+        pos.approveAddress(user1);
         vm.prank(user1);
         pos.createVendor("VendorRefund");
         uint256 vendorID = 1;
         pos.createOrder(vendorID, 100 ether, 2);
         uint256 expectedPayment = 50 ether;
 
-        // Fund contributors.
+        // Fund contributor.
         vm.deal(user2, 100 ether);
-
-        // Only one payment is made so far.
         vm.prank(user2);
         pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
 
@@ -237,6 +239,7 @@ contract PoSTest is Test {
     }
 
     function testRefundRevertsIfProcessed() public {
+        // Create vendor with default caller (test contract), which is approved.
         pos.createVendor("VendorRefundProcessed");
         uint256 vendorID = 1;
         pos.createOrder(vendorID, 100 ether, 2);
@@ -252,13 +255,13 @@ contract PoSTest is Test {
         pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
 
         // A refund should now revert because the order has been processed.
-        vm.prank(user1);
-        vm.expectRevert("Order already processed");
+        vm.expectRevert(bytes("Order already processed"));
         pos.refund(vendorID, 1);
     }
 
     function testOnlyVendorCanRefund() public {
-        // Create a vendor with user1 as the payout address.
+        // Approve user1 to create vendor.
+        pos.approveAddress(user1);
         vm.prank(user1);
         pos.createVendor("VendorOnlyVendorRefund");
         uint256 vendorID = 1;
@@ -271,7 +274,7 @@ contract PoSTest is Test {
 
         // A refund initiated by a non-vendor (user2) should revert.
         vm.prank(user2);
-        vm.expectRevert("Only the vendor can initiate refunds");
+        vm.expectRevert(bytes("Only the vendor can initiate refunds"));
         pos.refund(vendorID, 1);
     }
 
