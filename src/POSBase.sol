@@ -7,17 +7,17 @@ import {Client} from "@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.s
 import {CCIPReceiver} from "@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol";
 import {IERC20} from "@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/utils/SafeERC20.sol";
-
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 interface IPaymentHandler {
     function pay(
-        string calldata vendorID,
-        string calldata orderID,
+        uint256 orderID,
         address payAs,
-        uint256 payAsChain
-    ) external payable;
+        uint256 payAsChain,
+        uint256 amount
+    ) external;
 }
 
-contract POSBase is CCIPReceiver, OwnerIsCreator {
+contract POSBase is CCIPReceiver, OwnerIsCreator,ReentrancyGuard {
     using SafeERC20 for IERC20;
 
     error NotEnoughBalance(uint256 currentBalance, uint256 calculatedFees);
@@ -35,8 +35,7 @@ contract POSBase is CCIPReceiver, OwnerIsCreator {
     );
 
     event PaymentReceived(
-        string vendorID,
-        string orderID,
+        uint256 orderID,
         address payAs,
         uint256 payAsChain,
         address token,
@@ -44,42 +43,44 @@ contract POSBase is CCIPReceiver, OwnerIsCreator {
     );
 
     IERC20 public immutable usdcToken;
-    mapping(uint64 => bool) public allowlistedDestinationChains;
+    mapping(uint256 => address) public approvedChainRecievers;
+    mapping(uint256 => uint64) public approvedChainSelectors;
 
-    constructor(address _router, address _usdc) CCIPReceiver(_router) {
+    IPaymentHandler public paymentHandler;
+    IRouterClient router;
+
+    constructor(address _router, address _usdc, address _posContract) CCIPReceiver(_router) {
         usdcToken = IERC20(_usdc);
+        paymentHandler = IPaymentHandler(_posContract);
+        rotuer = IRouterClient(getRouter());
     }
 
-    modifier onlyAllowlistedDestinationChain(uint64 _destinationChainSelector) {
-        if (!allowlistedDestinationChains[_destinationChainSelector])
-            revert DestinationChainNotAllowlisted(_destinationChainSelector);
+    modifier OnlyPoS() {
+        require(msg.sender == address(paymentHandler), "Only PoS contract can call this function");
         _;
     }
 
-    function allowlistDestinationChain(uint64 _selector, bool allowed) external onlyOwner {
-        allowlistedDestinationChains[_selector] = allowed;
-    }
 
     function sendPayment(
-        uint64 destinationChainSelector,
-        address payAs,
-        uint256 payAsChain,
+        address payer,
+        uint256 payerChain,
+        uint256 orderID,
         uint256 amount
-    )
-        external
-        onlyOwner
-        onlyAllowlistedDestinationChain(destinationChainSelector)
+    ) external OnlyPoS nonReentrant
         returns (bytes32 messageId)
     {
-        require(payAs != address(0), "Invalid payAs address");
+        require(approvedChainRecievers[payerChain] != address(0), "Chain Not Supported");
 
         Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](1);
+
+        SafeERC20.safeTransferFrom(usdcToken, msg.sender, address(this), amount);
+
         tokenAmounts[0] = Client.EVMTokenAmount({token: address(usdcToken), amount: amount});
 
-        bytes memory data = abi.encode(payAs, payAsChain);
+        bytes memory data = abi.encode(payer, orderID);
 
         Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
-            receiver: abi.encode(payAs),
+            receiver: abi.encode(approvedChainRecievers[payerChain]),
             data: data,
             tokenAmounts: tokenAmounts,
             extraArgs: Client._argsToBytes(
@@ -88,36 +89,39 @@ contract POSBase is CCIPReceiver, OwnerIsCreator {
             feeToken: address(0) // native gas
         });
 
-        IRouterClient router = IRouterClient(getRouter());
-        uint256 fees = router.getFee(destinationChainSelector, message);
+        
+        uint256 fees = router.getFee(approvedChainSelectors[payerChain], message);
         if (fees > address(this).balance) revert NotEnoughBalance(address(this).balance, fees);
 
-        usdcToken.approve(address(router), amount);
+        usdcToken.safeIncreaseAllowance(address(router), amount);
 
-        messageId = router.ccipSend{value: fees}(destinationChainSelector, message);
+        messageId = router.ccipSend{value: fees}(approvedChainSelectors[payerChain], message);
 
-        emit PaymentSent(messageId, destinationChainSelector, payAs, payAsChain, address(usdcToken), amount, fees);
+        emit PaymentSent(messageId, approvedChainSelectors[payerChain], payer, payerChain, address(usdcToken), amount, fees);
         return messageId;
     }
 
-    function _ccipReceive(Client.Any2EVMMessage memory message) internal override {
-        (string memory vendorID, string memory orderID, address payAs, uint256 payAsChain) = abi.decode(
+    function _ccipReceive(Client.Any2EVMMessage memory message) internal override nonReentrant {
+        (  address payAs, uint256 payAsChain, uint256 orderID, uint256 amount) = abi.decode(
             message.data,
-            (string, string, address, uint256)
+            (uint256, address, uint256, uint256)
         );
-
         require(message.destTokenAmounts.length == 1, "Invalid token amount");
         require(message.destTokenAmounts[0].token == address(usdcToken), "Only USDC allowed");
 
         uint256 amount = message.destTokenAmounts[0].amount;
 
-        usdcToken.approve(address(this), amount);
-        IPaymentHandler(address(this)).pay{value: 0}(vendorID, orderID, payAs, payAsChain);
+        usdcToken.safeIncreaseAllowance(address(paymentHandler), amount);
+        paymentHandler.pay( orderID, payAs, payAsChain, amount);
 
-        emit PaymentReceived(vendorID, orderID, payAs, payAsChain, address(usdcToken), amount);
+        emit PaymentReceived( orderID, payAs, payAsChain,address(usdcToken), amount);
     }
 
-    receive() external payable {}
+    function setApprovedChain(uint256 chainID, address receiver, uint64 chainSelector) external onlyOwner {
+        approvedChainRecievers[chainID] = receiver;
+        approvedChainSelectors[chainID] = chainSelector;
+    }
+
 
     function withdrawETH(address beneficiary) external onlyOwner {
         (bool success, ) = beneficiary.call{value: address(this).balance}("");
