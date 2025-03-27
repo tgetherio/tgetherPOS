@@ -2,8 +2,9 @@
 pragma solidity ^0.8.28;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
 
-contract PoS is ReentrancyGuard {
+contract PoS is ReentrancyGuard, Ownable{
 
 
     // --- Storage Structures ---
@@ -42,10 +43,11 @@ contract PoS is ReentrancyGuard {
     mapping(uint256 => Vendor) private vendors;      // Maps vendorID to Vendor
     mapping(address => bool) public approvedAddresses; // Access control for approved addresses
 
+    mapping(uint256 => mapping(address => bool)) public vendorApprovedAddresses; // Access control for approved addresses
     // --- Modifiers ---
     // restricts function access to approved addresses
-    modifier onlyApproved() {
-        require(approvedAddresses[msg.sender], "Not an approved address");
+    modifier onlyApproved(uint256 vendorID) {
+        require(approvedAddresses[msg.sender] || vendorApprovedAddresses[vendorID][msg.sender], "Not an approved address");
         _;
     }
 
@@ -57,14 +59,14 @@ contract PoS is ReentrancyGuard {
 
 
     // --- Constructor ---
-    constructor() {
+    constructor() Ownable(msg.sender) {
         // Initialize the contract deployer as an approved address
         approvedAddresses[msg.sender] = true;
     }
 
 
     // --- Vendor Management ---
-    function createVendor(string calldata name) external onlyApproved {
+    function createVendor(string calldata name) external {
         uint256 vendorID = nextVendorID++;
         Vendor storage vendor = vendors[vendorID];
         require(!vendor.exists, "Vendor already exists");
@@ -76,7 +78,7 @@ contract PoS is ReentrancyGuard {
         vendorIndex[vendorID] = vendorList.length - 1;
     }
 
-    function deleteVendor(uint256 vendorID) external onlyApproved vendorExists(vendorID) {
+    function deleteVendor(uint256 vendorID) external onlyApproved(vendorID) vendorExists(vendorID)  {
         uint256 index = vendorIndex[vendorID];
         uint256 lastVendorID = vendorList[vendorList.length - 1];
         vendorList[index] = lastVendorID;
@@ -92,7 +94,7 @@ contract PoS is ReentrancyGuard {
         uint256 vendorID,
         uint256 totalAmount,
         uint256 numPayers
-    ) external onlyApproved vendorExists(vendorID) {
+    ) external onlyApproved(vendorID) vendorExists(vendorID) {
         Vendor storage vendor = vendors[vendorID];
         uint256 orderID = nextOrderID++;
         Order storage order = vendor.orders[orderID];
@@ -145,13 +147,20 @@ contract PoS is ReentrancyGuard {
         }
     }
 
+    function approveVendorAddress(uint256 vendorID, address _approvedAddress ) external onlyApproved(vendorID) {
+        vendorApprovedAddresses[vendorID][_approvedAddress] = true;
+    }
+
+    function removeVendorApprovedAddress(uint256 vendorID, address _unapprovedAddress) external onlyApproved(vendorID) {
+         vendorApprovedAddresses[vendorID][_unapprovedAddress] = false;
+    }
 
     // --- Admin Functions ---
-    function approveAddress(address addr) external onlyApproved {
+    function approveAddress(address addr) external onlyOwner {
         approvedAddresses[addr] = true;
     }
 
-    function removeApprovedAddress(address addr) external onlyApproved {
+    function removeApprovedAddress(address addr) external onlyOwner {
         approvedAddresses[addr] = false;
     }
 
