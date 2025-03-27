@@ -129,14 +129,14 @@ contract PoSTest is Test {
 
         // Payment from user1.
         vm.prank(user1);
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
 
         // Payment from user2 should complete the order.
         vm.prank(user2);
         // Expect the PaymentProcessed event to be emitted when order is fully paid.
         vm.expectEmit(true, true, true, true);
         emit PoS.PaymentProcessed(vendorID, 1, user2, block.chainid, orderTotal);
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+        pos.pay{value: expectedPayment}(vendorID, 1, user2, block.chainid);
 
         // Verify order is now processed and the currentAmount equals the total.
         ( , uint256 currentAmount, bool processed, ) = pos.getOrderDetails(vendorID, 1);
@@ -169,14 +169,14 @@ contract PoSTest is Test {
 
         vm.deal(user1, 100 ether);
 
-        // First payment succeeds.
+        // First payment succeeds, using user1 explicitly as payAs.
         vm.prank(user1);
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
 
         // A second payment from the same address should revert.
         vm.prank(user1);
         vm.expectRevert(bytes("Already paid"));
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
     }
 
     function testIncorrectPaymentAmountReverts() public {
@@ -188,7 +188,7 @@ contract PoSTest is Test {
         vm.deal(user1, 100 ether);
         vm.prank(user1);
         vm.expectRevert(bytes("Incorrect payment amount"));
-        pos.pay{value: wrongPayment}(vendorID, 1, address(0), 0);
+        pos.pay{value: wrongPayment}(vendorID, 1, user1, 0);
     }
 
     function testProxyPaymentReverts() public {
@@ -250,9 +250,9 @@ contract PoSTest is Test {
 
         // Complete the order by receiving both payments.
         vm.prank(user1);
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
         vm.prank(user2);
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+        pos.pay{value: expectedPayment}(vendorID, 1, user2, block.chainid);
 
         // A refund should now revert because the order has been processed.
         vm.expectRevert(bytes("Order already processed"));
@@ -271,6 +271,9 @@ contract PoSTest is Test {
         vm.deal(user2, 100 ether);
         vm.prank(user2);
         pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+
+        // Approve user2 so that the onlyApproved modifier passes.
+        pos.approveAddress(user2);
 
         // A refund initiated by a non-vendor (user2) should revert.
         vm.prank(user2);
