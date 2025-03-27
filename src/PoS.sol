@@ -76,6 +76,7 @@ contract PoS is ReentrancyGuard, Ownable{
         vendor.exists = true;
         vendorList.push(vendorID);
         vendorIndex[vendorID] = vendorList.length - 1;
+        vendorApprovedAddresses[vendorID][msg.sender] = true;
     }
 
     function deleteVendor(uint256 vendorID) external onlyApproved(vendorID) vendorExists(vendorID)  {
