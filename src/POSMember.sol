@@ -10,7 +10,6 @@ import {IERC20} from "@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-sol
 import {SafeERC20} from "@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/utils/SafeERC20.sol";
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 
-// POSMember contract handles cross-chain payments and refunds using Chainlink CCIP
 contract POSMember is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -82,21 +81,19 @@ contract POSMember is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
 
         tokenAmounts[0] = Client.EVMTokenAmount({token: address(usdcToken), amount: amount});
 
-        // Encode payment data (payer address, chain ID, orderID, and amount)
-        bytes memory data = abi.encode(msg.sender, block.chainid, orderID, amount);
-
         // Track the payment for potential refunds
         orderIDToAmount[orderID][msg.sender] += amount;
 
-        // Create a CCIP message
         Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
-            receiver: abi.encode(baseReceiverContract),
-            data: data,
-            tokenAmounts: tokenAmounts,
+            receiver: abi.encode(baseReceiverContract), // ABI-encoded receiver address
+            data: abi.encode(msg.sender, block.chainid, orderID, amount), // ABI-encoded string message
+            tokenAmounts: tokenAmounts, // Tokens amounts
             extraArgs: Client._argsToBytes(
-                Client.EVMExtraArgsV2({gasLimit: 400_000, allowOutOfOrderExecution: true})
+                Client.EVMExtraArgsV1({
+                    gasLimit: 200_000
+                })
             ),
-            feeToken: address(0) // Fees paid in native gas
+            feeToken: address(0) // Setting feeToken to zero address, indicating native asset will be used for fees
         });
 
         // Get the fee for the transaction
@@ -104,11 +101,10 @@ contract POSMember is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
         if (fees > address(this).balance) revert NotEnoughBalance(address(this).balance, fees);
 
         // Approve router to spend USDC for the message
-        usdcToken.safeIncreaseAllowance(address(router), amount);
+        usdcToken.approve(address(router), amount);
 
         // Send the message using CCIP
         messageId = router.ccipSend{value: fees}(baseChainSelector, message);
-
         emit PaymentSent(messageId, msg.sender, block.chainid, address(usdcToken), amount, orderID, fees);
         return messageId;
     }

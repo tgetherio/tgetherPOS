@@ -2,13 +2,14 @@
 pragma solidity 0.8.24;
 
 // Import necessary interfaces and libraries from Chainlink CCIP and OpenZeppelin
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {IRouterClient} from "@chainlink/contracts-ccip/src/v0.8/ccip/interfaces/IRouterClient.sol";
 import {OwnerIsCreator} from "@chainlink/contracts-ccip/src/v0.8/shared/access/OwnerIsCreator.sol";
 import {Client} from "@chainlink/contracts-ccip/src/v0.8/ccip/libraries/Client.sol";
 import {CCIPReceiver} from "@chainlink/contracts-ccip/src/v0.8/ccip/applications/CCIPReceiver.sol";
 import {IERC20} from "@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/IERC20.sol";
 import {SafeERC20} from "@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-solidity/v4.8.3/contracts/token/ERC20/utils/SafeERC20.sol";
-import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+import {console} from "lib/forge-std/src/Test.sol";// POSMember contract handles cross-chain payments and refunds using Chainlink CCIP
 
 // Interface for the external payment handler contract that handles final payment processing.
 interface IPaymentHandler {
@@ -27,7 +28,7 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
     // Custom errors for gas-efficient error handling
     error NotEnoughBalance(uint256 currentBalance, uint256 calculatedFees);
     error DestinationChainNotAllowlisted(uint64 destinationChainSelector);
-    error InvalidReceiverAddress();
+    error InvalidTokenAddress();
 
     // Event emitted when a payment is sent via CCIP
     event PaymentSent(
@@ -49,6 +50,9 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
         uint256 amount
     );
 
+    // Event When Wrong ERC20 Payment Recieved
+    event WrongERC20PaymentRecieved(address token, uint256 amount, address sender, uint256 chainId);
+
     // Immutable USDC token contract address
     IERC20 public immutable usdcToken;
 
@@ -66,7 +70,7 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
     constructor(address _router, address _usdc, address _posContract) CCIPReceiver(_router) {
         usdcToken = IERC20(_usdc);
         paymentHandler = IPaymentHandler(_posContract);
-        rotuer = IRouterClient(getRouter()); // Note: Typo in 'router' -> 'rotuer'
+        router = IRouterClient(getRouter()); // Note: Typo in 'router' -> 'rotuer'
     }
 
     // Modifier to ensure only the payment handler contract can call specific functions
@@ -90,14 +94,23 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
         uint256 orderID,
         uint256 amount
     ) external OnlyPoS nonReentrant returns (bytes32 messageId) {
+
+        console.log("payer chain", payerChain);
+
         require(approvedChainRecievers[payerChain] != address(0), "Chain Not Supported");
 
         // Create token amounts for the CCIP message
         Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](1);
 
         // Transfer USDC from the sender to the contract
-        SafeERC20.safeTransferFrom(usdcToken, msg.sender, address(this), amount);
+        console.log("balance", usdcToken.balanceOf(address(this)));
 
+        console.log("balance s", usdcToken.balanceOf(msg.sender));
+        
+
+        SafeERC20.safeTransferFrom(usdcToken, msg.sender, address(this), amount);
+        console.log("Transferred %d USDC from %s to contract", amount, msg.sender);
+        console.log("balance", usdcToken.balanceOf(address(this)));
         tokenAmounts[0] = Client.EVMTokenAmount({token: address(usdcToken), amount: amount});
 
         // Encode payment data including payer and order details
@@ -109,7 +122,7 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
             data: data,
             tokenAmounts: tokenAmounts,
             extraArgs: Client._argsToBytes(
-                Client.EVMExtraArgsV2({gasLimit: 400_000, allowOutOfOrderExecution: true})
+                Client.EVMExtraArgsV1({gasLimit: 400_000})
             ),
             feeToken: address(0) // Native gas fees
         });
@@ -121,8 +134,12 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
         // Approve the router to spend the necessary USDC amount
         usdcToken.safeIncreaseAllowance(address(router), amount);
 
+        console.log("Approved chain receiver: %s", approvedChainRecievers[payerChain]);
+        console.log("Approved chain selector: %d", approvedChainSelectors[payerChain]);
+
         // Send the CCIP message and store the messageId
         messageId = router.ccipSend{value: fees}(approvedChainSelectors[payerChain], message);
+        console.log("HERE");
 
         emit PaymentSent(messageId, approvedChainSelectors[payerChain], payer, payerChain, address(usdcToken), amount, fees);
         return messageId;
@@ -134,17 +151,23 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
      * @param message The received CCIP message containing payment details.
      */
     function _ccipReceive(Client.Any2EVMMessage memory message) internal override nonReentrant {
-        (address payAs, uint256 payAsChain, uint256 orderID, uint256 amount) = abi.decode(
+        (address payAs, uint256 payAsChain, uint256 orderID,) = abi.decode(
             message.data,
-            (uint256, address, uint256, uint256)
+            (address, uint256, uint256, uint256)
         );
 
+        console.log("Received payment from %s on chain %d for order %d", payAs, payAsChain, orderID);
+
         require(message.destTokenAmounts.length == 1, "Invalid token amount");
-        require(message.destTokenAmounts[0].token == address(usdcToken), "Only USDC allowed");
 
         uint256 amount = message.destTokenAmounts[0].amount;
+        address token = message.destTokenAmounts[0].token;
 
-        // Approve the payment handler to spend the USDC
+        if (token != address(usdcToken)) {
+            emit WrongERC20PaymentRecieved(token, amount, payAs, payAsChain);
+            revert InvalidTokenAddress();
+        }
+
         usdcToken.safeIncreaseAllowance(address(paymentHandler), amount);
         paymentHandler.pay(orderID, payAs, payAsChain, amount);
 
