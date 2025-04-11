@@ -72,7 +72,7 @@ contract CrossChainPayment is Test {
         // Perform cross-chain payment
         uint256 orderID = 1;
         uint256 amount = 1;
-        bytes32 messageId = member.sendPayment(orderID, amount);
+        member.sendPayment(orderID, amount);
 
         // Expect payment to be received by POSBase
         uint256 mockContractBalance = ccipUSDCToken.balanceOf(address(mockPay));

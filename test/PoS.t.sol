@@ -2,153 +2,315 @@
 pragma solidity ^0.8.28;
 
 import "forge-std/Test.sol";
-import "forge-std/console.sol"; // For step-by-step logging
-import "../src/PoS.sol";
+import "../src/PoS.sol"; // adjust the path as necessary
 
 contract PoSTest is Test {
-    PoS pos;                        // Instance of the PoS contract
-    address vendor = address(0x1);  // Vendor's address (Airbnb)
-    address payer1 = address(0x2);  // First payer
-    address payer2 = address(0x3);  // Second payer
-    address payer3 = address(0x4);  // Third payer
-    address admin = address(this);  // Test contract as admin
+    PoS public pos;
+    
+    // Test addresses (using Foundry’s cheatcodes)
+    address public user1;
+    address public user2;
+    address public nonApproved;
+    address public approvedUser;
+    address public user3; // used in refund tests
+
+    // Allow receiving Ether in the test contract.
+    receive() external payable {}
 
     function setUp() public {
-        // Deploy the PoS contract
+        // Deploy the PoS contract; the deployer (this contract) is approved by default.
         pos = new PoS();
-        // Approve the vendor address (assuming the contract requires this)
-        pos.approveAddress(vendor);
-        // Fund the payers with enough ether for testing
-        vm.deal(payer1, 10 ether);
-        vm.deal(payer2, 10 ether);
-        vm.deal(payer3, 10 ether);
-        console.log("Setup complete: PoS contract deployed, vendor approved, payers funded with 10 ether each");
+
+        // Set up test addresses using vm.addr(n)
+        user1 = vm.addr(1);
+        user2 = vm.addr(2);
+        nonApproved = vm.addr(3);
+        approvedUser = vm.addr(4);
+        user3 = vm.addr(5);
+
+        // Approve an extra address so we can test approved address management.
+        pos.approveAddress(approvedUser);
     }
 
-    function testFullFlow() public {
-        // Step 1: Vendor creates their profile
-        vm.prank(vendor);
-        pos.createVendor("Airbnb");
-        console.log("Step 1: Vendor 'Airbnb' created");
+    /*//////////////////////////////////////////////////////////////
+                              APPROVED ACCESS
+    //////////////////////////////////////////////////////////////*/
 
-        // Step 2: Vendor creates an order for 3 payers, total 3 ether
-        uint256 totalAmount = 3 ether;
-        uint256 numPayers = 3;
-        vm.prank(vendor);
-        pos.createOrder("Airbnb", "Order1", totalAmount, numPayers);
-        console.log("Step 2: Order created: total=%s, numPayers=%s", totalAmount, numPayers);
-
-        // Step 3: Each payer sends their payment (1 ether each)
-        uint256 expectedAmount = totalAmount / numPayers; // 1 ether
-        console.log("Vendor balance before payments: %s", vendor.balance);
-
-        // Payer1 pays
-        vm.prank(payer1);
-        pos.pay{value: expectedAmount}("Airbnb", "Order1", payer1, 1);
-        (uint256 t1, uint256 c1, bool p1, ) = pos.getOrderDetails("Airbnb", "Order1");
-        console.log("Step 3a: After Payer1: total=%s, current=%s, processed=%s", t1, c1, p1);
-
-        // Payer2 pays
-        vm.prank(payer2);
-        pos.pay{value: expectedAmount}("Airbnb", "Order1", payer2, 1);
-        (uint256 t2, uint256 c2, bool p2, ) = pos.getOrderDetails("Airbnb", "Order1");
-        console.log("Step 3b: After Payer2: total=%s, current=%s, processed=%s", t2, c2, p2);
-
-        // Payer3 pays with debugging
-        vm.prank(payer3);
-        try pos.pay{value: expectedAmount}("Airbnb", "Order1", payer3, 1) {
-            console.log("Step 3c: Payer3 payment succeeded");
-        } catch Error(string memory reason) {
-            console.log("Step 3c: Payer3 payment reverted with reason: %s", reason);
-            assertTrue(false, "Payer3 payment should not revert");
-        } catch {
-            console.log("Step 3c: Payer3 payment reverted without reason");
-            assertTrue(false, "Payer3 payment should not revert");
-        }
-
-        // Step 4: Verify the final state
-        (uint256 orderTotal, uint256 currentAmount, bool processed, ) = pos.getOrderDetails("Airbnb", "Order1");
-        console.log("Step 4: Final state: total=%s, current=%s, processed=%s", orderTotal, currentAmount, processed);
-        assertEq(orderTotal, 0, "Total amount should be reset after processing");
-        assertEq(currentAmount, 3 ether, "Current amount should be 3 ether");
-        assertTrue(processed, "Order should be marked as processed");
-
-        // Step 5: Verify vendor received payment
-        console.log("Vendor balance after processing: %s", vendor.balance);
-        assertEq(vendor.balance, 3 ether, "Vendor should have received 3 ether");
-
-        // Step 6: Verify contributions are tracked correctly
-        PoS.Contribution[] memory contributions = pos.getContributions("Airbnb", "Order1");
-        assertEq(contributions.length, 3, "There should be 3 contributions");
-        assertEq(contributions[0].payer, payer1, "Payer1 should be recorded");
-        assertEq(contributions[0].amount, 1 ether, "Payer1 paid 1 ether");
-        assertEq(contributions[1].payer, payer2, "Payer2 should be recorded");
-        assertEq(contributions[1].amount, 1 ether, "Payer2 paid 1 ether");
-        assertEq(contributions[2].payer, payer3, "Payer3 should be recorded");
-        assertEq(contributions[2].amount, 1 ether, "Payer3 paid 1 ether");
-        console.log("Step 6: Contributions verified for all 3 payers");
+    function testOnlyApprovedCanCallFunctions() public {
+        // nonApproved address should not be allowed to create a vendor.
+        vm.prank(nonApproved);
+        vm.expectRevert(bytes("Not an approved address"));
+        pos.createVendor("NonApprovedVendor");
     }
 
-    // Additional Test: Incorrect payment amount
-    function testIncorrectPaymentAmount() public {
-        vm.prank(vendor);
-        pos.createVendor("Airbnb");
-        vm.prank(vendor);
-        pos.createOrder("Airbnb", "Order1", 3 ether, 3);
-
-        vm.prank(payer1);
-        vm.expectRevert("Incorrect payment amount");
-        pos.pay{value: 0.5 ether}("Airbnb", "Order1", payer1, 1);
-        console.log("Test: Payment of 0.5 ether (less than expected) reverted");
-
-        vm.prank(payer1);
-        vm.expectRevert("Incorrect payment amount");
-        pos.pay{value: 1.5 ether}("Airbnb", "Order1", payer1, 1);
-        console.log("Test: Payment of 1.5 ether (more than expected) reverted");
+    function testApprovedAddressManagement() public {
+        // approvedUser was approved in setUp; let it create a vendor.
+        vm.prank(approvedUser);
+        pos.createVendor("ApprovedVendor");
+        
+        // Now remove approval and check that the address can no longer perform restricted actions.
+        pos.removeApprovedAddress(approvedUser);
+        vm.prank(approvedUser);
+        vm.expectRevert(bytes("Not an approved address"));
+        pos.createVendor("ShouldFail");
     }
 
-    // Additional Test: Double payment from the same address
-    function testDoublePayment() public {
-        vm.prank(vendor);
-        pos.createVendor("Airbnb");
-        vm.prank(vendor);
-        pos.createOrder("Airbnb", "Order1", 3 ether, 3);
+    /*//////////////////////////////////////////////////////////////
+                           VENDOR MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
 
-        vm.prank(payer1);
-        pos.pay{value: 1 ether}("Airbnb", "Order1", payer1, 1);
+    function testCreateVendorAndDeleteVendor() public {
+        // Create a vendor as an approved address (deployer)
+        pos.createVendor("Vendor1");
+        uint256 vendorID = 1; // first vendor should have ID 1
 
-        vm.prank(payer1);
-        vm.expectRevert("Already paid");
-        pos.pay{value: 1 ether}("Airbnb", "Order1", payer1, 1);
-        console.log("Test: Second payment from Payer1 reverted");
+        // Create an order on the vendor to prove it exists.
+        pos.createOrder(vendorID, 100 ether, 2);
+
+        // Now delete the vendor.
+        pos.deleteVendor(vendorID);
+
+        // Subsequent operations using the vendor should revert.
+        vm.expectRevert(bytes("Vendor does not exist"));
+        pos.createOrder(vendorID, 100 ether, 2);
     }
 
-    // Additional Test: Payment after order is processed
-    function testPaymentAfterProcessed() public {
-        vm.prank(vendor);
-        pos.createVendor("Airbnb");
-        vm.prank(vendor);
-        pos.createOrder("Airbnb", "Order1", 3 ether, 3);
+    /*//////////////////////////////////////////////////////////////
+                           ORDER MANAGEMENT
+    //////////////////////////////////////////////////////////////*/
 
-        vm.prank(payer1);
-        pos.pay{value: 1 ether}("Airbnb", "Order1", payer1, 1);
-        vm.prank(payer2);
-        pos.pay{value: 1 ether}("Airbnb", "Order1", payer2, 1);
-        vm.prank(payer3);
-        pos.pay{value: 1 ether}("Airbnb", "Order1", payer3, 1);
+    function testCreateOrder() public {
+        pos.createVendor("VendorOrder");
+        uint256 vendorID = 1;
+        pos.createOrder(vendorID, 100 ether, 2);
 
-        vm.prank(payer1);
-        vm.expectRevert("Order already processed");
-        pos.pay{value: 1 ether}("Airbnb", "Order1", payer1, 1);
-        console.log("Test: Payment after order processed reverted");
+        (uint256 totalAmount, uint256 currentAmount, bool processed, uint256 numPayers) = pos.getOrderDetails(vendorID, 1);
+        assertEq(totalAmount, 100 ether, "Total amount mismatch");
+        assertEq(currentAmount, 0, "Current amount should be zero initially");
+        assertTrue(!processed, "Order should not be processed yet");
+        assertEq(numPayers, 2, "Number of payers mismatch");
     }
 
-    // Additional Test: Unauthorized vendor creation
-    function testUnauthorizedVendorCreation() public {
-        address unauthorized = address(0x5);
-        vm.prank(unauthorized);
-        vm.expectRevert("Not an approved address");
-        pos.createVendor("UnauthorizedVendor");
-        console.log("Test: Unauthorized vendor creation reverted");
+    function testCreateOrderFailsForNonExistentVendor() public {
+        // Calling createOrder with a vendorID that does not exist should revert.
+        vm.expectRevert(bytes("Vendor does not exist"));
+        pos.createOrder(999, 100 ether, 2);
     }
+
+    function testGetOrderDetailsFailsForNonExistentOrder() public {
+        pos.createVendor("VendorTest");
+        uint256 vendorID = 1;
+        vm.expectRevert(bytes("Order does not exist"));
+        pos.getOrderDetails(vendorID, 999);
+    }
+
+    function testGetContributionsFailsForNonExistentOrder() public {
+        pos.createVendor("VendorTest");
+        uint256 vendorID = 1;
+        vm.expectRevert(bytes("Order does not exist"));
+        pos.getContributions(vendorID, 999);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               PAYMENT
+    //////////////////////////////////////////////////////////////*/
+
+    function testPayAndProcessOrder() public {
+        pos.createVendor("VendorPay");
+        uint256 vendorID = 1;
+        uint256 orderTotal = 100 ether;
+        uint256 numPayers = 2;
+        pos.createOrder(vendorID, orderTotal, numPayers);
+        uint256 expectedPayment = orderTotal / numPayers; // 50 ether each
+
+        // Fund test users.
+        vm.deal(user1, 100 ether);
+        vm.deal(user2, 100 ether);
+
+        // Payment from user1.
+        vm.prank(user1);
+        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
+
+        // Payment from user2 should complete the order.
+        vm.prank(user2);
+        // Expect the PaymentProcessed event to be emitted when order is fully paid.
+        vm.expectEmit(true, true, true, true);
+        emit PoS.PaymentProcessed(vendorID, 1, user2, block.chainid, orderTotal);
+        pos.pay{value: expectedPayment}(vendorID, 1, user2, block.chainid);
+
+        // Verify order is now processed and the currentAmount equals the total.
+        ( , uint256 currentAmount, bool processed, ) = pos.getOrderDetails(vendorID, 1);
+        assertTrue(processed);
+        assertEq(currentAmount, orderTotal, "Current amount should equal total after processing");
+    }
+
+    function testPayWithCustomChainID() public {
+        pos.createVendor("VendorCustomChain");
+        uint256 vendorID = 1;
+        pos.createOrder(vendorID, 100 ether, 2);
+        uint256 expectedPayment = 50 ether;
+
+        vm.deal(user1, 100 ether);
+        uint256 customChainID = 999;
+
+        // Payment with payAs explicitly equal to msg.sender uses the provided chainID.
+        vm.prank(user1);
+        pos.pay{value: expectedPayment}(vendorID, 1, user1, customChainID);
+
+        PoS.Contribution[] memory contributions = pos.getContributions(vendorID, 1);
+        assertEq(contributions[0].chainID, customChainID, "ChainID should match custom value");
+    }
+
+    function testDoublePaymentReverts() public {
+        pos.createVendor("VendorDouble");
+        uint256 vendorID = 1;
+        pos.createOrder(vendorID, 100 ether, 2);
+        uint256 expectedPayment = 50 ether;
+
+        vm.deal(user1, 100 ether);
+
+        // First payment succeeds, using user1 explicitly as payAs.
+        vm.prank(user1);
+        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
+
+        // A second payment from the same address should revert.
+        vm.prank(user1);
+        vm.expectRevert(bytes("Already paid"));
+        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
+    }
+
+    function testIncorrectPaymentAmountReverts() public {
+        pos.createVendor("VendorIncorrectAmount");
+        uint256 vendorID = 1;
+        pos.createOrder(vendorID, 100 ether, 2);
+        uint256 wrongPayment = 40 ether; // Expected is 50 ether
+
+        vm.deal(user1, 100 ether);
+        vm.prank(user1);
+        vm.expectRevert(bytes("Incorrect payment amount"));
+        pos.pay{value: wrongPayment}(vendorID, 1, user1, 0);
+    }
+
+    function testProxyPaymentReverts() public {
+        pos.createVendor("VendorProxy");
+        uint256 vendorID = 1;
+        pos.createOrder(vendorID, 100 ether, 2);
+        uint256 expectedPayment = 50 ether;
+
+        vm.deal(user1, 100 ether);
+        // Attempt a proxy payment: payAs is non-zero and not equal to msg.sender.
+        vm.prank(user1);
+        vm.expectRevert(bytes("Proxy payments not allowed"));
+        pos.pay{value: expectedPayment}(vendorID, 1, user2, 0);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                               REFUND
+    //////////////////////////////////////////////////////////////*/
+
+    function testRefundProcess() public {
+        // Approve user1 to create vendor.
+        pos.approveAddress(user1);
+        vm.prank(user1);
+        pos.createVendor("VendorRefund");
+        uint256 vendorID = 1;
+        pos.createOrder(vendorID, 100 ether, 2);
+        uint256 expectedPayment = 50 ether;
+
+        // Fund contributor.
+        vm.deal(user2, 100 ether);
+        vm.prank(user2);
+        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+
+        // Record user2's balance before refund.
+        uint256 balanceBeforeRefund = user2.balance;
+
+        // Initiate refund from the vendor (user1).
+        vm.prank(user1);
+        pos.refund(vendorID, 1);
+
+        // After refund, the order's current amount should be reset.
+        ( , uint256 currentAmount, , ) = pos.getOrderDetails(vendorID, 1);
+        assertEq(currentAmount, 0, "Order current amount should be zero after refund");
+
+        // Verify that user2 was refunded the expected payment.
+        uint256 balanceAfterRefund = user2.balance;
+        assertEq(balanceAfterRefund - balanceBeforeRefund, expectedPayment, "Refund amount incorrect");
+    }
+
+    function testRefundRevertsIfProcessed() public {
+        // Create vendor with default caller (test contract), which is approved.
+        pos.createVendor("VendorRefundProcessed");
+        uint256 vendorID = 1;
+        pos.createOrder(vendorID, 100 ether, 2);
+        uint256 expectedPayment = 50 ether;
+
+        vm.deal(user1, 100 ether);
+        vm.deal(user2, 100 ether);
+
+        // Complete the order by receiving both payments.
+        vm.prank(user1);
+        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
+        vm.prank(user2);
+        pos.pay{value: expectedPayment}(vendorID, 1, user2, block.chainid);
+
+        // A refund should now revert because the order has been processed.
+        vm.expectRevert(bytes("Order already processed"));
+        pos.refund(vendorID, 1);
+    }
+
+    function testOnlyVendorCanRefund() public {
+        // Approve user1 to create vendor.
+        pos.approveAddress(user1);
+        vm.prank(user1);
+        pos.createVendor("VendorOnlyVendorRefund");
+        uint256 vendorID = 1;
+        pos.createOrder(vendorID, 100 ether, 2);
+        uint256 expectedPayment = 50 ether;
+
+        vm.deal(user2, 100 ether);
+        vm.prank(user2);
+        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+
+        // Approve user2 so that the onlyApproved modifier passes.
+        pos.approveAddress(user2);
+
+        // A refund initiated by a non-vendor (user2) should revert.
+        vm.prank(user2);
+        vm.expectRevert(bytes("Only the vendor can initiate refunds"));
+        pos.refund(vendorID, 1);
+    }
+
+    /*//////////////////////////////////////////////////////////////
+                           GETTER FUNCTIONS
+    //////////////////////////////////////////////////////////////*/
+
+    function testGetContributions() public {
+        pos.createVendor("VendorContrib");
+        uint256 vendorID = 1;
+        pos.createOrder(vendorID, 100 ether, 2);
+        uint256 expectedPayment = 50 ether;
+
+        vm.deal(user1, 100 ether);
+        vm.deal(user2, 100 ether);
+
+        vm.prank(user1);
+        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+        vm.prank(user2);
+        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+
+        PoS.Contribution[] memory contributions = pos.getContributions(vendorID, 1);
+        assertEq(contributions.length, 2, "Should have two contributions");
+        assertEq(contributions[0].amount, expectedPayment, "First contribution amount mismatch");
+        assertEq(contributions[1].amount, expectedPayment, "Second contribution amount mismatch");
+    }
+    
+    // Emit declaration so that vm.expectEmit can match the event.
+    event PaymentProcessed(
+        uint256 vendorID,
+        uint256 orderID,
+        address indexed payAs,
+        uint256 indexed payAsChain,
+        uint256 totalAmount
+    );
 }

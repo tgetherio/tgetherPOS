@@ -44,8 +44,14 @@ contract POSMember is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
     address public baseReceiverContract; // Contract address on the base chain
     IRouterClient router;
 
+    struct OrderPayment {
+        uint256 orderID; // Unique identifier for the order
+        uint256 amount; // Amount paid
+        uint256 refunded; //Amount Refunded
+    }
+
     // Track payments associated with orderIDs and payers
-    mapping(uint256 => mapping(address => uint256)) public orderIDToAmount;
+    mapping(uint256 => mapping(address => OrderPayment)) public orderIdAddressToPayment;
 
     /**
      * @dev Initializes the contract with router, USDC token, base chain selector, and base receiver contract.
@@ -82,7 +88,7 @@ contract POSMember is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
         tokenAmounts[0] = Client.EVMTokenAmount({token: address(usdcToken), amount: amount});
 
         // Track the payment for potential refunds
-        orderIDToAmount[orderID][msg.sender] += amount;
+        orderIdAddressToPayment[orderID][msg.sender].amount += amount;
 
         Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
             receiver: abi.encode(baseReceiverContract), // ABI-encoded receiver address
@@ -124,13 +130,13 @@ contract POSMember is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
         require(message.destTokenAmounts[0].token == address(usdcToken), "Only USDC allowed");
         uint256 amount = message.destTokenAmounts[0].amount;
         
-        require(orderIDToAmount[orderID][msg.sender] >= amount, "Payment was never processed through this contract");
+        require((orderIdAddressToPayment[orderID][payer].amount - orderIdAddressToPayment[orderID][payer].refunded) >= amount, "Refund more than ever sent in this contract - not allowed");
 
         // Deduct the refunded amount from tracking
-        orderIDToAmount[orderID][msg.sender] -= amount;
 
         // Transfer the refund to the payer
         usdcToken.transfer(payer, amount);
+        orderIdAddressToPayment[orderID][msg.sender].refunded  += amount;
 
         emit RefundReceived(payer, amount, orderID);
     }

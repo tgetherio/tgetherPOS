@@ -95,22 +95,15 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
         uint256 amount
     ) external OnlyPoS nonReentrant returns (bytes32 messageId) {
 
-        console.log("payer chain", payerChain);
-
         require(approvedChainRecievers[payerChain] != address(0), "Chain Not Supported");
+
+
+        SafeERC20.safeTransferFrom(usdcToken, msg.sender, address(this), amount);
 
         // Create token amounts for the CCIP message
         Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](1);
 
-        // Transfer USDC from the sender to the contract
-        console.log("balance", usdcToken.balanceOf(address(this)));
 
-        console.log("balance s", usdcToken.balanceOf(msg.sender));
-        
-
-        SafeERC20.safeTransferFrom(usdcToken, msg.sender, address(this), amount);
-        console.log("Transferred %d USDC from %s to contract", amount, msg.sender);
-        console.log("balance", usdcToken.balanceOf(address(this)));
         tokenAmounts[0] = Client.EVMTokenAmount({token: address(usdcToken), amount: amount});
 
         // Encode payment data including payer and order details
@@ -132,14 +125,12 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
         if (fees > address(this).balance) revert NotEnoughBalance(address(this).balance, fees);
 
         // Approve the router to spend the necessary USDC amount
+
         usdcToken.safeIncreaseAllowance(address(router), amount);
 
-        console.log("Approved chain receiver: %s", approvedChainRecievers[payerChain]);
-        console.log("Approved chain selector: %d", approvedChainSelectors[payerChain]);
 
         // Send the CCIP message and store the messageId
         messageId = router.ccipSend{value: fees}(approvedChainSelectors[payerChain], message);
-        console.log("HERE");
 
         emit PaymentSent(messageId, approvedChainSelectors[payerChain], payer, payerChain, address(usdcToken), amount, fees);
         return messageId;
@@ -155,8 +146,6 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
             message.data,
             (address, uint256, uint256, uint256)
         );
-
-        console.log("Received payment from %s on chain %d for order %d", payAs, payAsChain, orderID);
 
         require(message.destTokenAmounts.length == 1, "Invalid token amount");
 

@@ -56,7 +56,7 @@ contract MOCKERC20POS {
         }
 
         // Proceed to send the refund via cross-chain payment
-        MockUSDCContract.approve(address(this), orders[orderID].amount);
+        MockUSDCContract.safeIncreaseAllowance(address(crossChainSender), orders[orderID].amount);
         crossChainSender.sendPayment(orders[orderID].payer, orders[orderID].payerchain, orderID, orders[orderID].amount);
     }
     
