@@ -5,6 +5,17 @@ import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
+interface IPOSBase {
+    function sendPayment(
+        address payer,
+        uint256 payerChain,
+        uint256 orderID,
+        uint256 amount
+    ) external returns (bytes32);
+}
+
+
 contract PoS is ReentrancyGuard {
 
     enum RefundType {
@@ -30,8 +41,9 @@ contract PoS is ReentrancyGuard {
         bytes32[] contributionKeys;
         uint256 amtRefunded;       // Amount refunded
         RefundType refundType;     // Refund type (NONE, PARTIAL, FULL)
-        uint256 amtToWithold;       // Amount withhold for gas fees
-        uint256 withheldSoFar;              // Flag to indicate if the amount has been withheld
+        uint256 amtToWithhold;       // Amount withhold for gas fees
+        uint256 withheldSoFar;       // Flag to indicate if the amount has been withheld
+        bool processed; // Flag to indicate if the order has been processed
     }
 
     struct Vendor {
@@ -64,8 +76,11 @@ contract PoS is ReentrancyGuard {
 
     address feeAddress; // Address to receive fees for creating orders 
     AggregatorV3Interface internal CBETHtoUSD;
-    IERC20 USDCcontract;   //Address to estimate witholdings in USDC
-    uint256 public fee = 1.5; // Fee on gas for managed order creation
+    IERC20 USDCcontract;   //Address to estimate withholdings in USDC
+    address public posBase; // address of CCIP POSBase
+
+    uint256 public estimatedOrderGas = 185000; // can be updated by owner
+    uint256 public feeMultiplierBps = 150; // Fee on gas for managed order creation
 
     // --- Modifiers ---
     // restricts function access to approved addresses
@@ -77,8 +92,7 @@ contract PoS is ReentrancyGuard {
     }
 
     modifier approvedOrderCreators(uint256 vendorID) {
-        require(vendors[vendorID].isActive, "Vendor is not Active");
-        require(msg.sender == vendors[vendorID].vendorAddress, "Only the vendor can create orders");
+        require(vendorApprovedAddresses[vendorID][msg.sender] || approvedAddresses[msg.sender], "Only the vendor or tg approvers can create orders");
         _;
     }
 
@@ -92,17 +106,16 @@ contract PoS is ReentrancyGuard {
         CBETHtoUSD = AggregatorV3Interface(_CBETHtoUSD);
         USDCcontract = IERC20(_USDCcontract);
 
-        
     }
 
 
     // --- Vendor Management ---
-    function createVendor(string calldata name) external onlyApproved {
+    function createVendor(string calldata name) external {
         Vendor storage vendor = vendors[vendorCounter];
         require(!vendor.isActive, "Vendor already exists");
         vendor.name = name;
         vendor.vendorAddress = msg.sender; // Vendor’s payout address
-        vendor.exists = true;
+        vendor.isActive = true;
         vendorList.push(vendorCounter);
         vendorIndex[vendorCounter] = vendorList.length - 1;
         vendorCounter++;
@@ -111,18 +124,18 @@ contract PoS is ReentrancyGuard {
 
     function deActivateVendor(uint256 vendorID) external activeVendor(vendorID) {
         require(msg.sender == vendors[vendorID].vendorAddress, "Only the vendor can deactivate");
-        uint256 index = vendorIndex[vendorID];
+        uint256 _index = vendorIndex[vendorID];
         uint256 lastVendorID = vendorList[vendorList.length - 1];
-        if (index != vendorList.length - 1) {
-            vendorList[index] = lastVendorID;
-            vendorIndex[lastVendorID] = index;
+        if (_index != vendorList.length - 1) {
+            vendorList[_index] = lastVendorID;
+            vendorIndex[lastVendorID] = _index;
         }
         vendorList.pop();
         vendors[vendorID].isActive = false;
         delete vendorIndex[vendorID];
     }
 
-    function activateVendor(uint256 vendorID) external onlyApproved {
+    function activateVendor(uint256 vendorID) external approvedOrderCreators(vendorID) {
         require(!vendors[vendorID].isActive, "Vendor already exists");
         require(msg.sender == vendors[vendorID].vendorAddress, "You do not own this vendor");
         vendors[vendorID].isActive = true;
@@ -133,7 +146,7 @@ contract PoS is ReentrancyGuard {
     function approveVendorAddress(
         uint256 vendorID,
         address addr
-    ) external onlyApproved activeVendor(vendorID) {
+    ) external approvedOrderCreators(vendorID) activeVendor(vendorID) {
        require(msg.sender == vendors[vendorID].vendorAddress, "Only the vendor can approve addresses");
         vendorApprovedAddresses[vendorID][addr] = true;
     }
@@ -141,16 +154,24 @@ contract PoS is ReentrancyGuard {
     function removeVendorAddress(
         uint256 vendorID,
         address addr
-    ) external onlyApproved activeVendor(vendorID) {
+    ) external approvedOrderCreators(vendorID) activeVendor(vendorID) {
        require(msg.sender == vendors[vendorID].vendorAddress, "Only the vendor can approve addresses");
         vendorApprovedAddresses[vendorID][addr] = false;
+    }
+
+    function setVendorPaymentReciever(
+        uint256 vendorID,
+        address addr
+    ) external activeVendor(vendorID) {
+       require(msg.sender == vendors[vendorID].vendorAddress, "Only the vendor can approve addresses");
+        vendors[vendorID].optionalPaymentReciever = addr;
     }
 
 
 
     // --- Order Management ---
-    function createOrder(uint256 _vendorID, uint256 _amount, string memory _vendorOrderId) external activeVendor(_vendorId) returns (uint256 orderId) {
-        uint256 witholding;
+    function createOrder(uint256 _vendorId, uint256 _amount, string memory _vendorOrderId) external activeVendor(_vendorId) approvedOrderCreators(_vendorId) returns (uint256 orderId) {
+        uint256 withholding;
 
         if (approvedAddresses[msg.sender]) {
             (
@@ -162,105 +183,155 @@ contract PoS is ReentrancyGuard {
             ) = CBETHtoUSD.latestRoundData();
 
             require(conversion > 0, "Invalid price feed");
-            uint256 gas = uint256(conversion) * tx.gasprice / 1e18;
-            witholding = gas * fee ; // 50% more than the gas price
+            withholding = (uint256(conversion) * tx.gasprice * estimatedOrderGas * feeMultiplierBps) / (1e18 * 100);
 
-        } else if (vendorApprovedAddresses[_vendorID][msg.sender]) {
-            witholding = 0;
+        } else if (vendorApprovedAddresses[_vendorId][msg.sender]) {
+            withholding = 0;
         } else {
             revert("Not an approved address");
         }
 
         // Create a new order
-        Order storage order = vendors[_vendorID].orders[orderCounter];
+        Order storage order = orders[orderCounter];
         order.totalAmount = _amount; // Set the total amount to 0 initially
-        order.amtToWithold = witholding; // Set the amount to withhold
+        order.amtToWithhold = withholding; // Set the amount to withhold
+        vendors[_vendorId].orderIDs.push(orderCounter);
 
         if (_vendorOrderId != "") {
             order.vendorOrderId = _vendorOrderId; // Set the vendor-specific order ID
         }
 
-        orderVendor[orderCounter] = _vendorId; // Map the order ID to the vendor ID
-        vendorOrderIDtoTgether[_vendorID][_vendorOrderId] = orderCounter; // Map the vendor's order ID to the order ID
+        OrderVendor[orderCounter] = _vendorId; // Map the order ID to the vendor ID
+
+        if (bytes(_vendorOrderId).length > 0) {
+            vendorOrderIDtoTgether[_vendorId][_vendorOrderId] = orderCounter;
+        }
+
+
         orderCounter++;
+
+
+        // Emit an event for the order creation
+        emit OrderCreated(orderCounter - 1, _vendorOrderId, _vendorId, _amount, withholding);
+
+        
         return orderCounter - 1; // Return the order ID
 
+
     }
 
 
-    // --- Payment Function (Including Cross-Chain Hooks) ---
-function pay(
-    uint256 _orderID,
-    address _payer,
-    uint256 _payerChain,
-    uint256 _amount
-) external nonReentrant {
-    require(orders[_orderID].totalAmount > 0, "Order does not exist");
+            // --- Payment Function (Including Cross-Chain Hooks) ---
+    function pay(
+            uint256 _orderID,
+            address _payer,
+            uint256 _payerChain,
+            uint256 _amount
+        ) external nonReentrant {
+            require(orders[_orderID].totalAmount > 0, "Order does not exist");
 
-    // Determine contributor and chain ID
-    address contributor = (_payer == address(0)) ? msg.sender : _payer;
-    uint256 chainID = (_payerChain == 0) ? block.chainid : _payerChain;
-    bytes32 key = getContributionKey(contributor, chainID);
+            address contributor = (_payer == address(0)) ? msg.sender : _payer;
+            uint256 chainID = (_payerChain == 0) ? block.chainid : _payerChain;
+            bytes32 key = getContributionKey(contributor, chainID);
 
-    Order storage order = orders[_orderID];
-    Contribution storage contrib = order.contributions[key];
+            Order storage order = orders[_orderID];
+            Contribution storage contrib = order.contributions[key];
 
-    // Add contribution data for fresh contributor  
-    if (contrib.amount == 0) {
-        order.contributionList.push(key);
-        contrib.payer = contributor;
-        contrib.chainID = chainID;
-    }
+            if (contrib.amount == 0) {
+                order.contributionKeys.push(key);
+                contrib.payer = contributor;
+                contrib.chainID = chainID;
+            }
 
-    contrib.amount += _amount;
-    order.currentAmount += _amount;
+            contrib.amount += _amount;
+            order.currentAmount += _amount;
 
-    uint256 sendAmount = _amount;
+            // Determine vendor recipient
+            Vendor storage v = vendors[OrderVendor[_orderID]];
+            address recipient = v.optionalPaymentReciever == address(0) ? v.vendorAddress : v.optionalPaymentReciever;
 
-    // Withholding logic
-    if (order.amtToWithold > 0 && order.withheldSoFar < order.amtToWithold) {
-        uint256 remainingToWithhold = order.amtToWithold - order.withheldSoFar;
-        if (_amount <= remainingToWithhold) {
-            order.withheldSoFar += _amount;
-            emit ContributionReceived(_orderID, contributor, chainID, _amount, orderVendor[_orderID]);
-            return;
+            uint256 feeToTake = 0;
+
+            if (order.amtToWithhold > 0 && order.withheldSoFar < order.amtToWithhold) {
+                uint256 remainingToWithhold = order.amtToWithhold - order.withheldSoFar;
+                if (_amount <= remainingToWithhold) {
+                    feeToTake = _amount;
+                } else {
+                    feeToTake = remainingToWithhold;
+                }
+                order.withheldSoFar += feeToTake;
+            }
+
+            uint256 vendorAmount = _amount - feeToTake;
+
+
+            // Transfer USDC: vendor receives net amount, fee address gets fee (if any)
+            require(USDCcontract.transferFrom(msg.sender, recipient, vendorAmount), "USDC transfer to vendor failed");
+
+            if (feeToTake > 0) {
+                require(feeAddress != address(0), "Fee address not set");
+                require(USDCcontract.transferFrom(msg.sender, feeAddress, feeToTake), "USDC fee transfer failed");
+            }
+
+            if (order.currentAmount >= order.totalAmount) {
+                order.processed = true;
+                emit OrderProcessed(_orderID, order.totalAmount, order.currentAmount);
+
+            }
+
+            emit ContributionReceived(_orderID, contributor, chainID, _amount, OrderVendor[_orderID]);
         }
 
-        order.withheldSoFar = order.amtToWithold;
-        sendAmount -= remainingToWithhold;
-    }
 
-    // Resolve vendor recipient
-    Vendor storage v = vendors[orderVendor[_orderID]];
-    address recipient = v.optionalPaymentReciever == address(0) ? v.vendorAddress : v.optionalPaymentReciever;
 
-    // Transfer remaining amount to vendor
-    require(USDCcontract.transferFrom(msg.sender, address(this), sendAmount), "USDC transfer failed to this contract");
-    require(USDCcontract.transfer(recipient, sendAmount), "USDC transfer failed to vendor");
 
-    emit ContributionReceived(_orderID, contributor, chainID, _amount, orderVendor[_orderID]);
-}
+    function refundOrder(uint256 orderID) external approvedOrderCreators(OrderVendor[orderID]) nonReentrant {
+        require(orders[orderID].totalAmount > 0, "Order does not exist");
+        uint256 vendorID = OrderVendor[orderID];
 
-    function refund(uint256 vendorID, uint256 orderID) 
-        external onlyApproved activeVendor(vendorID) nonReentrant {
-        Vendor storage vendor = vendors[vendorID];
-        require(msg.sender == vendor.vendorAddress, "Only the vendor can initiate refunds");
-        Order storage order = vendor.orders[orderID];
-        require(!order.processed, "Order already processed");
-        require(order.currentAmount > 0, "No funds to refund");
+        Order storage order = orders[orderID];
+        require(order.refundType != RefundType.FULL, "Order already fully refunded");
 
-        // Refund each contributor
-        for (uint256 i = 0; i < order.contributionList.length; i++) {
-            Contribution memory contribution = order.contributionList[i];
-            payable(contribution.payer).transfer(contribution.amount);
+        for (uint256 i = 0; i < order.contributionKeys.length; i++) {
+            bytes32 key = order.contributionKeys[i];
+            Contribution storage contrib = order.contributions[key];
+            uint256 remaining = contrib.amount - contrib.amountRefunded;
+            if (remaining > 0) {
+                refundContribution(orderID, key, remaining);
+            }
         }
 
-        // Reset the order’s current amount
-        order.currentAmount = 0;
-        // Optional: Mark the order as refunded (requires adding a `refunded` bool to the Order struct)
-        order.refunded = true;
+        order.refundType = RefundType.FULL;
+        emit RefundProcessed(vendorID, orderID, order.amtRefunded);
     }
+    function refundContribution(uint256 orderID, bytes32 key, uint256 refundAmount) public  approvedOrderCreators(OrderVendor[orderID]) nonReentrant{
+        Order storage order = orders[orderID];
+        Contribution storage contrib = order.contributions[key];
 
+        require(contrib.amount > 0, "No contribution");
+        require(refundAmount > 0, "Refund must be greater than 0");
+
+        uint256 refundable = contrib.amount - contrib.amountRefunded;
+        require(refundAmount <= refundable, "Refund exceeds contribution");
+
+        contrib.amountRefunded += refundAmount;
+        order.amtRefunded += refundAmount;
+
+        if (contrib.chainID == block.chainid) {
+            require(USDCcontract.transfer(contrib.payer, refundAmount), "Refund transfer failed");
+        } else {
+            USDCcontract.approve(address(posBase), refundAmount);
+            IPOSBase(posBase).sendPayment(contrib.payer, contrib.chainID, orderID, refundAmount);
+        }
+
+        emit ContributionRefunded(orderID, contrib.payer, contrib.chainID, refundAmount);
+
+        // Always set to PARTIAL here
+        if (order.refundType == RefundType.NONE) {
+            order.refundType = RefundType.PARTIAL;
+        }
+
+    }
     // --- Internal Functions --- 
     function getContributionKey(address payer, uint256 chainID) internal pure returns (bytes32) {
     return keccak256(abi.encodePacked(payer, chainID));
@@ -274,28 +345,95 @@ function pay(
     function removeApprovedAddress(address addr) external onlyOwner {
         approvedAddresses[addr] = false;
     }
+    function setFeeAddress(address _feeAddress) external onlyOwner {
+    require(_feeAddress != address(0), "Cannot set zero address");
+    feeAddress = _feeAddress;
+    }
+
+
+    function setPOSBase(address _posBase) external onlyOwner {
+        posBase = _posBase;
+    }
+
+
+    function setFeeAndGas(uint256 _feeMultiplierBps, uint256 _estimatedOrderGas) external onlyOwner {
+        require(_feeMultiplierBps >= 100, "Multiplier must be >= 100");
+        require(_estimatedOrderGas > 0, "Gas estimate must be > 0");
+        feeMultiplierBps = _feeMultiplierBps;
+        estimatedOrderGas = _estimatedOrderGas;
+    }
+
+    function setFeeMultiplier(uint256 _bps) external onlyOwner {
+        require(_bps >= 100, "Must be >= 1x");
+        feeMultiplierBps = _bps;
+    }
+
+    function setEstimatedOrderGas(uint256 gas) external onlyOwner {
+        require(gas > 0, "Invalid gas amount");
+        estimatedOrderGas = gas;
+    }
+
 
 
     // --- Getter Functions ---
-    function getOrderDetails(uint256 vendorID, uint256 orderID)
-        external view activeVendor(vendorID)
+    function getOrderDetails(uint256 vendorID, uint256 orderId)
+        external view
         returns (uint256 totalAmount, uint256 currentAmount, bool processed, uint256 numPayers) {
-        Order storage order = vendors[vendorID].orders[orderID];
-        require(order.orderID != 0, "Order does not exist");
-        return (order.totalAmount, order.currentAmount, order.processed, order.numPayers);
+        Order storage order = orders[orderId];
+        require(orders[orderId].totalAmount != 0, "Order does not exist");
+        return (order.totalAmount, order.currentAmount, order.processed, order.contributionKeys.length);
     }
 
-    function getContributions(uint256 vendorID, uint256 orderID)
-        external view activeVendor(vendorID)
-        returns (Contribution[] memory) {
-        Order storage order = vendors[vendorID].orders[orderID];
-        require(order.orderID != 0, "Order does not exist");
-        return vendors[vendorID].orders[orderID].contributionList;
+    function getContributions(uint256 orderId) external view returns (Contribution[] memory) {
+        Order storage order = orders[orderId];
+        require(order.totalAmount != 0, "Order does not exist");
+
+        Contribution[] memory result = new Contribution[](order.contributionKeys.length);
+        for (uint256 i = 0; i < order.contributionKeys.length; i++) {
+            result[i] = order.contributions[order.contributionKeys[i]];
+        }
+
+        return result;
     }
+
+    function isVendorApproved(uint256 vendorID, address user) external view returns (bool) {
+    return vendorApprovedAddresses[vendorID][user];
+        }
+    
+        function getPaginatedOrders(uint256 start, uint256 count) external view returns (uint256[] memory) {
+        uint256[] memory results = new uint256[](count);
+        uint256 end = start + count;
+        require(end <= orderCounter, "Out of range");
+
+        for (uint256 i = 0; i < count; i++) {
+            results[i] = start + i;
+        }
+
+        return results;
+    }
+
+    function getPaginatedVendorOrders(uint256 vendorID, uint256 start, uint256 count) external view returns (uint256[] memory) {
+        uint256[] storage allOrders = vendors[vendorID].orderIDs;
+        require(start + count <= allOrders.length, "Out of range");
+
+        uint256[] memory results = new uint256[](count);
+        for (uint256 i = 0; i < count; i++) {
+            results[i] = allOrders[start + i];
+        }
+
+        return results;
+    }
+    function getVendor(uint256 vendorID) external view returns (Vendor memory);
+    function getOrder(uint256 orderID) external view returns (Order memory);
 
 
     // --- Events ---
+    event OrderCreated(uint256 indexed orderId, string indexed vendorOrderId,  uint256 indexed vendorId, uint256 amount, uint256 withholding);
+
     event ContributionReceived(uint256 orderID, address payer, uint256 chainID, uint256 amount, uint256 vendor);
 
     event RefundProcessed(uint256 vendorID, uint256 orderID, uint256 totalRefunded);
+    event ContributionRefunded(uint256 orderId, address payer, uint256 chainID, uint256 amount);
+
+    event OrderProcessed(uint256 orderID, uint256 totalAmount, uint256 currentAmount);
 }
