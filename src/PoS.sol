@@ -16,7 +16,7 @@ interface IPOSBase {
 }
 
 
-contract PoS is ReentrancyGuard {
+contract PoS is ReentrancyGuard, Ownable{
 
     enum RefundType {
         NONE,
@@ -110,7 +110,7 @@ contract PoS is ReentrancyGuard {
 
 
     // --- Vendor Management ---
-    function createVendor(string calldata name) external {
+    function createVendor(string calldata name) external returns (uint256 vendorID) {
         Vendor storage vendor = vendors[vendorCounter];
         require(!vendor.isActive, "Vendor already exists");
         vendor.name = name;
@@ -119,6 +119,7 @@ contract PoS is ReentrancyGuard {
         vendorList.push(vendorCounter);
         vendorIndex[vendorCounter] = vendorList.length - 1;
         vendorCounter++;
+        return vendorCounter - 1; // Return the vendor ID
 
     }
 
@@ -197,14 +198,11 @@ contract PoS is ReentrancyGuard {
         order.amtToWithhold = withholding; // Set the amount to withhold
         vendors[_vendorId].orderIDs.push(orderCounter);
 
-        if (_vendorOrderId != "") {
-            order.vendorOrderId = _vendorOrderId; // Set the vendor-specific order ID
-        }
-
         OrderVendor[orderCounter] = _vendorId; // Map the order ID to the vendor ID
 
         if (bytes(_vendorOrderId).length > 0) {
             vendorOrderIDtoTgether[_vendorId][_vendorOrderId] = orderCounter;
+            order.vendorOrderId = _vendorOrderId; // Set the vendor-specific order ID
         }
 
 
@@ -223,65 +221,60 @@ contract PoS is ReentrancyGuard {
 
             // --- Payment Function (Including Cross-Chain Hooks) ---
     function pay(
-            uint256 _orderID,
-            address _payer,
-            uint256 _payerChain,
-            uint256 _amount
-        ) external nonReentrant {
-            require(orders[_orderID].totalAmount > 0, "Order does not exist");
+        uint256 _orderID,
+        address _payer,
+        uint256 _payerChain,
+        uint256 _amount
+    ) external nonReentrant {
+        require(orders[_orderID].totalAmount > 0, "Order does not exist");
 
-            address contributor = (_payer == address(0)) ? msg.sender : _payer;
-            uint256 chainID = (_payerChain == 0) ? block.chainid : _payerChain;
-            bytes32 key = getContributionKey(contributor, chainID);
+        Order storage order = orders[_orderID];
 
-            Order storage order = orders[_orderID];
-            Contribution storage contrib = order.contributions[key];
+        address contributor = (_payer == address(0)) ? msg.sender : _payer;
+        uint256 chainID = (_payerChain == 0) ? block.chainid : _payerChain;
+        bytes32 key = getContributionKey(contributor, chainID);
 
-            if (contrib.amount == 0) {
-                order.contributionKeys.push(key);
-                contrib.payer = contributor;
-                contrib.chainID = chainID;
-            }
+        Contribution storage contrib = order.contributions[key];
 
-            contrib.amount += _amount;
-            order.currentAmount += _amount;
-
-            // Determine vendor recipient
-            Vendor storage v = vendors[OrderVendor[_orderID]];
-            address recipient = v.optionalPaymentReciever == address(0) ? v.vendorAddress : v.optionalPaymentReciever;
-
-            uint256 feeToTake = 0;
-
-            if (order.amtToWithhold > 0 && order.withheldSoFar < order.amtToWithhold) {
-                uint256 remainingToWithhold = order.amtToWithhold - order.withheldSoFar;
-                if (_amount <= remainingToWithhold) {
-                    feeToTake = _amount;
-                } else {
-                    feeToTake = remainingToWithhold;
-                }
-                order.withheldSoFar += feeToTake;
-            }
-
-            uint256 vendorAmount = _amount - feeToTake;
-
-
-            // Transfer USDC: vendor receives net amount, fee address gets fee (if any)
-            require(USDCcontract.transferFrom(msg.sender, recipient, vendorAmount), "USDC transfer to vendor failed");
-
-            if (feeToTake > 0) {
-                require(feeAddress != address(0), "Fee address not set");
-                require(USDCcontract.transferFrom(msg.sender, feeAddress, feeToTake), "USDC fee transfer failed");
-            }
-
-            if (order.currentAmount >= order.totalAmount) {
-                order.processed = true;
-                emit OrderProcessed(_orderID, order.totalAmount, order.currentAmount);
-
-            }
-
-            emit ContributionReceived(_orderID, contributor, chainID, _amount, OrderVendor[_orderID]);
+        if (contrib.amount == 0) {
+            order.contributionKeys.push(key);
+            contrib.payer = contributor;
+            contrib.chainID = chainID;
         }
 
+        contrib.amount += _amount;
+        order.currentAmount += _amount;
+
+        // Determine recipient and vendor
+        uint256 vendorID = OrderVendor[_orderID];
+        Vendor storage v = vendors[vendorID];
+        address recipient = v.optionalPaymentReciever == address(0) ? v.vendorAddress : v.optionalPaymentReciever;
+
+        // Handle fees
+        uint256 feeToTake = 0;
+        if (order.amtToWithhold > 0 && order.withheldSoFar < order.amtToWithhold) {
+            uint256 remainingToWithhold = order.amtToWithhold - order.withheldSoFar;
+            feeToTake = (_amount <= remainingToWithhold) ? _amount : remainingToWithhold;
+            order.withheldSoFar += feeToTake;
+        }
+
+        uint256 vendorAmount = _amount - feeToTake;
+
+        // Transfers
+        require(USDCcontract.transferFrom(msg.sender, recipient, vendorAmount), "USDC transfer to vendor failed");
+
+        if (feeToTake > 0) {
+            require(feeAddress != address(0), "Fee address not set");
+            require(USDCcontract.transferFrom(msg.sender, feeAddress, feeToTake), "USDC fee transfer failed");
+        }
+
+        if (order.currentAmount >= order.totalAmount) {
+            order.processed = true;
+            emit OrderProcessed(_orderID, order.totalAmount, order.currentAmount);
+        }
+
+        emit ContributionReceived(_orderID, contributor, chainID, _amount, vendorID);
+    }
 
 
 
@@ -297,14 +290,24 @@ contract PoS is ReentrancyGuard {
             Contribution storage contrib = order.contributions[key];
             uint256 remaining = contrib.amount - contrib.amountRefunded;
             if (remaining > 0) {
-                refundContribution(orderID, key, remaining);
+                _refundContribution(orderID, key, remaining);
             }
         }
 
         order.refundType = RefundType.FULL;
         emit RefundProcessed(vendorID, orderID, order.amtRefunded);
     }
-    function refundContribution(uint256 orderID, bytes32 key, uint256 refundAmount) public  approvedOrderCreators(OrderVendor[orderID]) nonReentrant{
+
+    function refundContribution(
+    uint256 orderID,
+    bytes32 key,
+    uint256 refundAmount
+    ) external approvedOrderCreators(OrderVendor[orderID]) nonReentrant {
+        _refundContribution(orderID, key, refundAmount);
+    }
+
+
+    function _refundContribution(uint256 orderID, bytes32 key, uint256 refundAmount) internal {
         Order storage order = orders[orderID];
         Contribution storage contrib = order.contributions[key];
 
@@ -318,20 +321,20 @@ contract PoS is ReentrancyGuard {
         order.amtRefunded += refundAmount;
 
         if (contrib.chainID == block.chainid) {
-            require(USDCcontract.transfer(contrib.payer, refundAmount), "Refund transfer failed");
+            require(USDCcontract.transferFrom(msg.sender, contrib.payer, refundAmount), "Refund transfer failed");
         } else {
+            require(USDCcontract.transferFrom(msg.sender, address(this), refundAmount), "Refund transfer failed");
             USDCcontract.approve(address(posBase), refundAmount);
             IPOSBase(posBase).sendPayment(contrib.payer, contrib.chainID, orderID, refundAmount);
         }
 
         emit ContributionRefunded(orderID, contrib.payer, contrib.chainID, refundAmount);
 
-        // Always set to PARTIAL here
         if (order.refundType == RefundType.NONE) {
             order.refundType = RefundType.PARTIAL;
         }
-
     }
+
     // --- Internal Functions --- 
     function getContributionKey(address payer, uint256 chainID) internal pure returns (bytes32) {
     return keccak256(abi.encodePacked(payer, chainID));
@@ -423,8 +426,6 @@ contract PoS is ReentrancyGuard {
 
         return results;
     }
-    function getVendor(uint256 vendorID) external view returns (Vendor memory);
-    function getOrder(uint256 orderID) external view returns (Order memory);
 
 
     // --- Events ---

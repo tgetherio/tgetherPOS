@@ -2,315 +2,164 @@
 pragma solidity ^0.8.28;
 
 import "forge-std/Test.sol";
-import "../src/PoS.sol"; // adjust the path as necessary
+import "../src/PoS.sol"; // Adjust path if needed
+
+contract RefundCaller {
+    function callRefund(PoS pos, uint256 orderId) external {
+        pos.refundOrder(orderId);
+    }
+}
 
 contract PoSTest is Test {
     PoS public pos;
-    
-    // Test addresses (using Foundry’s cheatcodes)
-    address public user1;
-    address public user2;
-    address public nonApproved;
-    address public approvedUser;
-    address public user3; // used in refund tests
 
-    // Allow receiving Ether in the test contract.
-    receive() external payable {}
+    address public user1 = address(0x1);
+    address public user2 = address(0x2);
+    address public user3 = address(0x3);
+
+    MockUSDC public mockUSDC;
+    MockOracle public mockOracle;
 
     function setUp() public {
-        // Deploy the PoS contract; the deployer (this contract) is approved by default.
-        pos = new PoS();
-
-        // Set up test addresses using vm.addr(n)
-        user1 = vm.addr(1);
-        user2 = vm.addr(2);
-        nonApproved = vm.addr(3);
-        approvedUser = vm.addr(4);
-        user3 = vm.addr(5);
-
-        // Approve an extra address so we can test approved address management.
-        pos.approveAddress(approvedUser);
+        mockUSDC = new MockUSDC();
+        mockOracle = new MockOracle();
+        pos = new PoS(address(mockOracle), address(mockUSDC));
     }
 
-    /*//////////////////////////////////////////////////////////////
-                              APPROVED ACCESS
-    //////////////////////////////////////////////////////////////*/
+    function testCreateAndPayOrder() public {
+        // Mint and approve tokens for users
+        mockUSDC.mint(user1, 1_000e6);
+        mockUSDC.mint(user2, 1_000e6);
+        mockUSDC.mint(user3, 1_000e6);
 
-    function testOnlyApprovedCanCallFunctions() public {
-        // nonApproved address should not be allowed to create a vendor.
-        vm.prank(nonApproved);
-        vm.expectRevert(bytes("Not an approved address"));
-        pos.createVendor("NonApprovedVendor");
-    }
-
-    function testApprovedAddressManagement() public {
-        // approvedUser was approved in setUp; let it create a vendor.
-        vm.prank(approvedUser);
-        pos.createVendor("ApprovedVendor");
-        
-        // Now remove approval and check that the address can no longer perform restricted actions.
-        pos.removeApprovedAddress(approvedUser);
-        vm.prank(approvedUser);
-        vm.expectRevert(bytes("Not an approved address"));
-        pos.createVendor("ShouldFail");
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                           VENDOR MANAGEMENT
-    //////////////////////////////////////////////////////////////*/
-
-    function testCreateVendorAndDeleteVendor() public {
-        // Create a vendor as an approved address (deployer)
-        pos.createVendor("Vendor1");
-        uint256 vendorID = 1; // first vendor should have ID 1
-
-        // Create an order on the vendor to prove it exists.
-        pos.createOrder(vendorID, 100 ether, 2);
-
-        // Now delete the vendor.
-        pos.deleteVendor(vendorID);
-
-        // Subsequent operations using the vendor should revert.
-        vm.expectRevert(bytes("Vendor does not exist"));
-        pos.createOrder(vendorID, 100 ether, 2);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                           ORDER MANAGEMENT
-    //////////////////////////////////////////////////////////////*/
-
-    function testCreateOrder() public {
-        pos.createVendor("VendorOrder");
-        uint256 vendorID = 1;
-        pos.createOrder(vendorID, 100 ether, 2);
-
-        (uint256 totalAmount, uint256 currentAmount, bool processed, uint256 numPayers) = pos.getOrderDetails(vendorID, 1);
-        assertEq(totalAmount, 100 ether, "Total amount mismatch");
-        assertEq(currentAmount, 0, "Current amount should be zero initially");
-        assertTrue(!processed, "Order should not be processed yet");
-        assertEq(numPayers, 2, "Number of payers mismatch");
-    }
-
-    function testCreateOrderFailsForNonExistentVendor() public {
-        // Calling createOrder with a vendorID that does not exist should revert.
-        vm.expectRevert(bytes("Vendor does not exist"));
-        pos.createOrder(999, 100 ether, 2);
-    }
-
-    function testGetOrderDetailsFailsForNonExistentOrder() public {
-        pos.createVendor("VendorTest");
-        uint256 vendorID = 1;
-        vm.expectRevert(bytes("Order does not exist"));
-        pos.getOrderDetails(vendorID, 999);
-    }
-
-    function testGetContributionsFailsForNonExistentOrder() public {
-        pos.createVendor("VendorTest");
-        uint256 vendorID = 1;
-        vm.expectRevert(bytes("Order does not exist"));
-        pos.getContributions(vendorID, 999);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                               PAYMENT
-    //////////////////////////////////////////////////////////////*/
-
-    function testPayAndProcessOrder() public {
-        pos.createVendor("VendorPay");
-        uint256 vendorID = 1;
-        uint256 orderTotal = 100 ether;
-        uint256 numPayers = 2;
-        pos.createOrder(vendorID, orderTotal, numPayers);
-        uint256 expectedPayment = orderTotal / numPayers; // 50 ether each
-
-        // Fund test users.
-        vm.deal(user1, 100 ether);
-        vm.deal(user2, 100 ether);
-
-        // Payment from user1.
         vm.prank(user1);
-        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
-
-        // Payment from user2 should complete the order.
+        mockUSDC.approve(address(pos), type(uint256).max);
         vm.prank(user2);
-        // Expect the PaymentProcessed event to be emitted when order is fully paid.
-        vm.expectEmit(true, true, true, true);
-        emit PoS.PaymentProcessed(vendorID, 1, user2, block.chainid, orderTotal);
-        pos.pay{value: expectedPayment}(vendorID, 1, user2, block.chainid);
+        mockUSDC.approve(address(pos), type(uint256).max);
+        vm.prank(user3);
+        mockUSDC.approve(address(pos), type(uint256).max);
 
-        // Verify order is now processed and the currentAmount equals the total.
-        ( , uint256 currentAmount, bool processed, ) = pos.getOrderDetails(vendorID, 1);
+        // Create vendor and order
+        pos.approveAddress(address(this));
+        pos.createVendor("TestVendor");
+        uint256 orderId = pos.createOrder(1, 300e6, "ORDER_X");
+
+        // Pay order
+        vm.prank(user1); pos.pay(orderId, address(0), 0, 100e6);
+        vm.prank(user2); pos.pay(orderId, address(0), 0, 100e6);
+        vm.prank(user3); pos.pay(orderId, address(0), 0, 100e6);
+
+        // Assert final state
+        (uint256 total, uint256 collected, bool processed, uint256 numPayers) = pos.getOrderDetails(1, orderId);
+        assertEq(total, 300e6);
+        assertEq(collected, 300e6);
         assertTrue(processed);
-        assertEq(currentAmount, orderTotal, "Current amount should equal total after processing");
+        assertEq(numPayers, 3);
     }
 
-    function testPayWithCustomChainID() public {
-        pos.createVendor("VendorCustomChain");
-        uint256 vendorID = 1;
-        pos.createOrder(vendorID, 100 ether, 2);
-        uint256 expectedPayment = 50 ether;
+    function testRefundOnly() public {
+        // Mint and approve tokens for users
+        mockUSDC.mint(user1, 1_000e6);
+        mockUSDC.mint(user2, 1_000e6);
+        mockUSDC.mint(user3, 1_000e6);
 
-        vm.deal(user1, 100 ether);
-        uint256 customChainID = 999;
-
-        // Payment with payAs explicitly equal to msg.sender uses the provided chainID.
         vm.prank(user1);
-        pos.pay{value: expectedPayment}(vendorID, 1, user1, customChainID);
-
-        PoS.Contribution[] memory contributions = pos.getContributions(vendorID, 1);
-        assertEq(contributions[0].chainID, customChainID, "ChainID should match custom value");
-    }
-
-    function testDoublePaymentReverts() public {
-        pos.createVendor("VendorDouble");
-        uint256 vendorID = 1;
-        pos.createOrder(vendorID, 100 ether, 2);
-        uint256 expectedPayment = 50 ether;
-
-        vm.deal(user1, 100 ether);
-
-        // First payment succeeds, using user1 explicitly as payAs.
-        vm.prank(user1);
-        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
-
-        // A second payment from the same address should revert.
-        vm.prank(user1);
-        vm.expectRevert(bytes("Already paid"));
-        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
-    }
-
-    function testIncorrectPaymentAmountReverts() public {
-        pos.createVendor("VendorIncorrectAmount");
-        uint256 vendorID = 1;
-        pos.createOrder(vendorID, 100 ether, 2);
-        uint256 wrongPayment = 40 ether; // Expected is 50 ether
-
-        vm.deal(user1, 100 ether);
-        vm.prank(user1);
-        vm.expectRevert(bytes("Incorrect payment amount"));
-        pos.pay{value: wrongPayment}(vendorID, 1, user1, 0);
-    }
-
-    function testProxyPaymentReverts() public {
-        pos.createVendor("VendorProxy");
-        uint256 vendorID = 1;
-        pos.createOrder(vendorID, 100 ether, 2);
-        uint256 expectedPayment = 50 ether;
-
-        vm.deal(user1, 100 ether);
-        // Attempt a proxy payment: payAs is non-zero and not equal to msg.sender.
-        vm.prank(user1);
-        vm.expectRevert(bytes("Proxy payments not allowed"));
-        pos.pay{value: expectedPayment}(vendorID, 1, user2, 0);
-    }
-
-    /*//////////////////////////////////////////////////////////////
-                               REFUND
-    //////////////////////////////////////////////////////////////*/
-
-    function testRefundProcess() public {
-        // Approve user1 to create vendor.
-        pos.approveAddress(user1);
-        vm.prank(user1);
-        pos.createVendor("VendorRefund");
-        uint256 vendorID = 1;
-        pos.createOrder(vendorID, 100 ether, 2);
-        uint256 expectedPayment = 50 ether;
-
-        // Fund contributor.
-        vm.deal(user2, 100 ether);
+        mockUSDC.approve(address(pos), type(uint256).max);
         vm.prank(user2);
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
+        mockUSDC.approve(address(pos), type(uint256).max);
+        vm.prank(user3);
+        mockUSDC.approve(address(pos), type(uint256).max);
 
-        // Record user2's balance before refund.
-        uint256 balanceBeforeRefund = user2.balance;
+        // Set up PoS
+        pos.createVendor("TestVendor");
+        // Create and pay an order
+        uint256 orderId = pos.createOrder(1, 300e6, "ORDER_X");
+        vm.prank(user1); pos.pay(orderId, address(0), 0, 100e6);
+        vm.prank(user2); pos.pay(orderId, address(0), 0, 100e6);
+        vm.prank(user3); pos.pay(orderId, address(0), 0, 100e6);
 
-        // Initiate refund from the vendor (user1).
-        vm.prank(user1);
-        pos.refund(vendorID, 1);
+        // Perform refund via a separate contract
+        mockUSDC.approve(address(pos), 300e6);
+        pos.refundOrder(orderId);
 
-        // After refund, the order's current amount should be reset.
-        ( , uint256 currentAmount, , ) = pos.getOrderDetails(vendorID, 1);
-        assertEq(currentAmount, 0, "Order current amount should be zero after refund");
+        // // Validate refunds
+        PoS.Contribution[] memory contribs = pos.getContributions(orderId);
+        for (uint i = 0; i < contribs.length; i++) {
+            assertEq(contribs[i].amount, contribs[i].amountRefunded);
+        }
+    }
+}
 
-        // Verify that user2 was refunded the expected payment.
-        uint256 balanceAfterRefund = user2.balance;
-        assertEq(balanceAfterRefund - balanceBeforeRefund, expectedPayment, "Refund amount incorrect");
+// --- Mock Contracts ---
+
+contract MockUSDC is IERC20 {
+    mapping(address => uint256) public balances;
+    mapping(address => mapping(address => uint256)) public allowances;
+
+    function mint(address to, uint256 amount) public {
+        balances[to] += amount;
     }
 
-    function testRefundRevertsIfProcessed() public {
-        // Create vendor with default caller (test contract), which is approved.
-        pos.createVendor("VendorRefundProcessed");
-        uint256 vendorID = 1;
-        pos.createOrder(vendorID, 100 ether, 2);
-        uint256 expectedPayment = 50 ether;
-
-        vm.deal(user1, 100 ether);
-        vm.deal(user2, 100 ether);
-
-        // Complete the order by receiving both payments.
-        vm.prank(user1);
-        pos.pay{value: expectedPayment}(vendorID, 1, user1, 0);
-        vm.prank(user2);
-        pos.pay{value: expectedPayment}(vendorID, 1, user2, block.chainid);
-
-        // A refund should now revert because the order has been processed.
-        vm.expectRevert(bytes("Order already processed"));
-        pos.refund(vendorID, 1);
+    function transfer(address to, uint256 amount) public override returns (bool) {
+        require(balances[msg.sender] >= amount, "Insufficient balance");
+        balances[msg.sender] -= amount;
+        balances[to] += amount;
+        return true;
     }
 
-    function testOnlyVendorCanRefund() public {
-        // Approve user1 to create vendor.
-        pos.approveAddress(user1);
-        vm.prank(user1);
-        pos.createVendor("VendorOnlyVendorRefund");
-        uint256 vendorID = 1;
-        pos.createOrder(vendorID, 100 ether, 2);
-        uint256 expectedPayment = 50 ether;
-
-        vm.deal(user2, 100 ether);
-        vm.prank(user2);
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
-
-        // Approve user2 so that the onlyApproved modifier passes.
-        pos.approveAddress(user2);
-
-        // A refund initiated by a non-vendor (user2) should revert.
-        vm.prank(user2);
-        vm.expectRevert(bytes("Only the vendor can initiate refunds"));
-        pos.refund(vendorID, 1);
+    function transferFrom(address from, address to, uint256 amount) public override returns (bool) {
+        require(balances[from] >= amount, "Insufficient balance");
+        require(allowances[from][msg.sender] >= amount, "Insufficient allowance");
+        allowances[from][msg.sender] -= amount;
+        balances[from] -= amount;
+        balances[to] += amount;
+        return true;
     }
 
-    /*//////////////////////////////////////////////////////////////
-                           GETTER FUNCTIONS
-    //////////////////////////////////////////////////////////////*/
-
-    function testGetContributions() public {
-        pos.createVendor("VendorContrib");
-        uint256 vendorID = 1;
-        pos.createOrder(vendorID, 100 ether, 2);
-        uint256 expectedPayment = 50 ether;
-
-        vm.deal(user1, 100 ether);
-        vm.deal(user2, 100 ether);
-
-        vm.prank(user1);
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
-        vm.prank(user2);
-        pos.pay{value: expectedPayment}(vendorID, 1, address(0), 0);
-
-        PoS.Contribution[] memory contributions = pos.getContributions(vendorID, 1);
-        assertEq(contributions.length, 2, "Should have two contributions");
-        assertEq(contributions[0].amount, expectedPayment, "First contribution amount mismatch");
-        assertEq(contributions[1].amount, expectedPayment, "Second contribution amount mismatch");
+    function approve(address spender, uint256 amount) public override returns (bool) {
+        allowances[msg.sender][spender] = amount;
+        return true;
     }
-    
-    // Emit declaration so that vm.expectEmit can match the event.
-    event PaymentProcessed(
-        uint256 vendorID,
-        uint256 orderID,
-        address indexed payAs,
-        uint256 indexed payAsChain,
-        uint256 totalAmount
-    );
+
+    function balanceOf(address account) external view override returns (uint256) {
+        return balances[account];
+    }
+
+    function totalSupply() external pure override returns (uint256) {
+        return 0;
+    }
+
+    function allowance(address owner, address spender) external view override returns (uint256) {
+        return allowances[owner][spender];
+    }
+
+    function decimals() external pure returns (uint8) {
+        return 6;
+    }
+}
+
+contract MockOracle is AggregatorV3Interface {
+    function latestRoundData() external pure override returns (
+        uint80, int256 answer, uint256, uint256, uint80
+    ) {
+        return (0, 2_000e8, 0, 0, 0); // 1 ETH = $2000
+    }
+
+    function decimals() external pure override returns (uint8) {
+        return 8;
+    }
+
+    function description() external pure override returns (string memory) {
+        return "Mock Oracle";
+    }
+
+    function version() external pure override returns (uint256) {
+        return 1;
+    }
+
+    function getRoundData(uint80) external pure override returns (
+        uint80, int256, uint256, uint256, uint80
+    ) {
+        revert("not implemented");
+    }
 }
