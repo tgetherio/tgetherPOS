@@ -50,7 +50,7 @@ contract PoSTest is Test {
         vm.prank(user3); pos.pay(orderId, address(0), 0, 100e6);
 
         // Assert final state
-        (uint256 total, uint256 collected, bool processed, uint256 numPayers) = pos.getOrderDetails(1, orderId);
+        (uint256 total, uint256 collected, bool processed, uint256 numPayers) = pos.getOrderDetails(orderId);
         assertEq(total, 300e6);
         assertEq(collected, 300e6);
         assertTrue(processed);
