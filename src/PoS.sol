@@ -52,7 +52,7 @@ contract PoS is ReentrancyGuard, Ownable{
         bool isActive;
         uint256[] orderIDs; // List of order IDs associated with this vendor
         address optionalPaymentReciever; // Optional address for payment receiver - if not recived will default to vendorAddress
-        uint256 withHoldingAllotment; // Amount of withholding the vendor is allowed to have
+        uint256 withholdingAllotment; // Amount of withholding the vendor is allowed to have
         bool approved;
     }
 
@@ -74,7 +74,7 @@ contract PoS is ReentrancyGuard, Ownable{
     
     mapping(uint256 => uint256) public vendorWithholdingDebt; // vendorID → unpaid withholding total
 
-    uint256 public defaultWithholdingDebt = 10e6; // e.g. 10 USDC (adjustable by owner)
+    uint256 public defaultWithholdingAllotment = 10e6; // e.g. 10 USDC (adjustable by owner)
 
 
     mapping(uint256 => mapping (address => bool)) private  vendorApprovedAddresses; // Access control for vendor approved addresses
@@ -132,7 +132,7 @@ contract PoS is ReentrancyGuard, Ownable{
         vendor.isActive = true;
         vendorList.push(vendorCounter);
         vendorIndex[vendorCounter] = vendorList.length - 1;
-        vendor.withHoldingAllotment = defaultWithholdingDebt; // Set default withholding allotment
+        vendor.withholdingAllotment = defaultWithholdingAllotment; // Set default withholding allotment
         vendorCounter++;
         return vendorCounter - 1; // Return the vendor ID
 
@@ -194,6 +194,7 @@ contract PoS is ReentrancyGuard, Ownable{
         } else {
             vendorWithholdingDebt[vendorID] -= amount;
         }
+        emit WithholdingPaid(vendorID, amount, vendorWithholdingDebt[vendorID]);
     }
 
     // --- Order Management ---
@@ -213,7 +214,7 @@ contract PoS is ReentrancyGuard, Ownable{
             withholding = (uint256(conversion) * tx.gasprice * estimatedOrderGas * feeMultiplierBps) / (1e18 * 100);
 
             vendorWithholdingDebt[_vendorId] += withholding;
-            require(vendorWithholdingDebt[_vendorId] <= vendors[_vendorId].withHoldingAllotment, "Unpaid withholding limit reached");
+            require(vendorWithholdingDebt[_vendorId] <= vendors[_vendorId].withholdingAllotment, "Unpaid withholding limit reached");
 
         } else if (vendorApprovedAddresses[_vendorId][msg.sender]) {
             withholding = 0;
@@ -421,12 +422,12 @@ contract PoS is ReentrancyGuard, Ownable{
 
 
 
-    function setVendorWithholdingAllotment(uint256 vendorID, uint256 allotment) external onlyOwner {
-        vendors[vendorID].withHoldingAllotment = allotment;
+    function setVendorwithholdingAllotment(uint256 vendorID, uint256 allotment) external onlyOwner {
+        vendors[vendorID].withholdingAllotment = allotment;
     }
 
-    function setDefaultWithholdingDebt(uint256 amount) external onlyOwner {
-        defaultWithholdingDebt = amount;
+    function setDefaultWithholdingAllotment(uint256 amount) external onlyOwner {
+        defaultWithholdingAllotment = amount;
     }
 
 
@@ -491,4 +492,6 @@ contract PoS is ReentrancyGuard, Ownable{
     event ContributionRefunded(uint256 orderId, address payer, uint256 chainID, uint256 amount);
 
     event OrderProcessed(uint256 orderID, uint256 totalAmount, uint256 currentAmount);
+    event WithholdingPaid(uint256 vendorID, uint256 amount, uint256 remainingDebt);
+
 }
