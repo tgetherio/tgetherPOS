@@ -74,6 +74,8 @@ contract PoS is ReentrancyGuard, Ownable{
 
     mapping(uint256 => mapping (address => bool)) private  vendorApprovedAddresses; // Access control for vendor approved addresses
 
+    bool gateVendors = false;
+
     address feeAddress; // Address to receive fees for creating orders 
     AggregatorV3Interface internal CBETHtoUSD;
     IERC20 USDCcontract;   //Address to estimate withholdings in USDC
@@ -115,7 +117,9 @@ contract PoS is ReentrancyGuard, Ownable{
         require(!vendor.isActive, "Vendor already exists");
         vendor.name = name;
         vendor.vendorAddress = msg.sender; // Vendor’s payout address
-        vendor.isActive = true;
+        if (!gateVendors){
+            vendor.isActive = true;
+        }
         vendorList.push(vendorCounter);
         vendorIndex[vendorCounter] = vendorList.length - 1;
         vendorCounter++;
@@ -124,7 +128,7 @@ contract PoS is ReentrancyGuard, Ownable{
     }
 
     function deActivateVendor(uint256 vendorID) external activeVendor(vendorID) {
-        require(msg.sender == vendors[vendorID].vendorAddress, "Only the vendor can deactivate");
+        require(msg.sender == vendors[vendorID].vendorAddress || approvedAddresses[msg.sender], "Only the vendor or tg address can deactivate");
         uint256 _index = vendorIndex[vendorID];
         uint256 lastVendorID = vendorList[vendorList.length - 1];
         if (_index != vendorList.length - 1) {
@@ -136,9 +140,9 @@ contract PoS is ReentrancyGuard, Ownable{
         delete vendorIndex[vendorID];
     }
 
-    function activateVendor(uint256 vendorID) external approvedOrderCreators(vendorID) {
+    function activateVendor(uint256 vendorID) external{
         require(!vendors[vendorID].isActive, "Vendor already exists");
-        require(msg.sender == vendors[vendorID].vendorAddress, "You do not own this vendor");
+        require(msg.sender == vendors[vendorID].vendorAddress || approvedAddresses[msg.sender] , "You do not own this vendor");
         vendors[vendorID].isActive = true;
         vendorList.push(vendorID);
         vendorIndex[vendorID] = vendorList.length - 1;
@@ -380,7 +384,7 @@ contract PoS is ReentrancyGuard, Ownable{
 
 
     // --- Getter Functions ---
-    function getOrderDetails(uint256 vendorID, uint256 orderId)
+    function getOrderDetails(uint256 orderId)
         external view
         returns (uint256 totalAmount, uint256 currentAmount, bool processed, uint256 numPayers) {
         Order storage order = orders[orderId];
@@ -426,6 +430,10 @@ contract PoS is ReentrancyGuard, Ownable{
         }
 
         return results;
+    }
+
+    function setgateVendors() external onlyOwner {
+        gateVendors = !gateVendors;
     }
 
 
