@@ -52,6 +52,7 @@ contract PoS is ReentrancyGuard, Ownable{
         bool isActive;
         uint256[] orderIDs; // List of order IDs associated with this vendor
         address optionalPaymentReciever; // Optional address for payment receiver - if not recived will default to vendorAddress
+        uint256 withHoldingAllotment; // Amount of withholding the vendor is allowed to have
         bool approved;
     }
 
@@ -70,6 +71,10 @@ contract PoS is ReentrancyGuard, Ownable{
     mapping(uint256 => uint256) public OrderVendor; // Maps orderId to vendorId
     mapping(address => uint256[]) public addressToOrderID; //Maps Address to Orders they are apart of
     mapping(uint256=> mapping(string => uint256)) public vendorOrderIDtoTgether; //Mapps a vendor's orderID to its tgether orderId
+    
+    mapping(uint256 => uint256) public vendorWithholdingDebt; // vendorID → unpaid withholding total
+
+    uint256 public defaultWithholdingDebt = 10e6; // e.g. 10 USDC (adjustable by owner)
 
 
     mapping(uint256 => mapping (address => bool)) private  vendorApprovedAddresses; // Access control for vendor approved addresses
@@ -127,6 +132,7 @@ contract PoS is ReentrancyGuard, Ownable{
         vendor.isActive = true;
         vendorList.push(vendorCounter);
         vendorIndex[vendorCounter] = vendorList.length - 1;
+        vendor.withHoldingAllotment = defaultWithholdingDebt; // Set default withholding allotment
         vendorCounter++;
         return vendorCounter - 1; // Return the vendor ID
 
@@ -177,7 +183,18 @@ contract PoS is ReentrancyGuard, Ownable{
         vendors[vendorID].optionalPaymentReciever = addr;
     }
 
+    function payWithholding(uint256 vendorID, uint256 amount) external nonReentrant {
+        require(vendorApprovedAddresses[vendorID][msg.sender], "Can not pay withholding");
+        require(vendorWithholdingDebt[vendorID] > 0, "No withholding owed");
 
+        require(USDCcontract.transferFrom(msg.sender, feeAddress, amount), "Payment failed");
+
+        if (amount >= vendorWithholdingDebt[vendorID]) {
+            vendorWithholdingDebt[vendorID] = 0;
+        } else {
+            vendorWithholdingDebt[vendorID] -= amount;
+        }
+    }
 
     // --- Order Management ---
     function createOrder(uint256 _vendorId, uint256 _amount, string memory _vendorOrderId) external activeVendor(_vendorId) approvedOrderCreators(_vendorId) requireApprovedVendor(_vendorId) returns (uint256 orderId) {
@@ -194,6 +211,9 @@ contract PoS is ReentrancyGuard, Ownable{
 
             require(conversion > 0, "Invalid price feed");
             withholding = (uint256(conversion) * tx.gasprice * estimatedOrderGas * feeMultiplierBps) / (1e18 * 100);
+
+            vendorWithholdingDebt[_vendorId] += withholding;
+            require(vendorWithholdingDebt[_vendorId] <= vendors[_vendorId].withHoldingAllotment, "Unpaid withholding limit reached");
 
         } else if (vendorApprovedAddresses[_vendorId][msg.sender]) {
             withholding = 0;
@@ -275,7 +295,12 @@ contract PoS is ReentrancyGuard, Ownable{
 
         if (feeToTake > 0) {
             require(feeAddress != address(0), "Fee address not set");
-            require(USDCcontract.transferFrom(msg.sender, feeAddress, feeToTake), "USDC fee transfer failed");
+            require(USDCcontract.transfer(feeAddress, feeToTake), "USDC fee transfer failed");
+            if (feeToTake >= vendorWithholdingDebt[vendorID]) {
+                vendorWithholdingDebt[vendorID] = 0;
+            } else {
+                vendorWithholdingDebt[vendorID] -= feeToTake;
+            }
         }
 
         if (order.currentAmount >= order.totalAmount) {
@@ -331,7 +356,12 @@ contract PoS is ReentrancyGuard, Ownable{
         order.amtRefunded += refundAmount;
 
         if (contrib.chainID == block.chainid) {
-            require(USDCcontract.transferFrom(msg.sender, contrib.payer, refundAmount), "Refund transfer failed");
+            // Step 1: Pull refund funds from vendor (msg.sender) into contract
+            require(USDCcontract.transferFrom(msg.sender, address(this), refundAmount), "Refund transfer to contract failed");
+
+            // Step 2: Forward refund to payer
+            require(USDCcontract.transfer(contrib.payer, refundAmount), "Refund transfer to payer failed");
+
         } else {
             require(USDCcontract.transferFrom(msg.sender, address(this), refundAmount), "Refund transfer failed");
             USDCcontract.approve(address(posBase), refundAmount);
@@ -385,6 +415,19 @@ contract PoS is ReentrancyGuard, Ownable{
         require(gas > 0, "Invalid gas amount");
         estimatedOrderGas = gas;
     }
+    function setApprovalsNecessary () external onlyOwner {
+        approvalsNecessary = !approvalsNecessary;
+    }
+
+
+
+    function setVendorWithholdingAllotment(uint256 vendorID, uint256 allotment) external onlyOwner {
+        vendors[vendorID].withHoldingAllotment = allotment;
+    }
+
+    function setDefaultWithholdingDebt(uint256 amount) external onlyOwner {
+        defaultWithholdingDebt = amount;
+    }
 
 
 
@@ -437,9 +480,6 @@ contract PoS is ReentrancyGuard, Ownable{
         return results;
     }
 
-    function setApprovalsNecessary () external onlyOwner {
-        approvalsNecessary = !approvalsNecessary;
-    }
 
 
     // --- Events ---
