@@ -52,7 +52,7 @@ contract PoS is ReentrancyGuard, Ownable{
         bool isActive;
         uint256[] orderIDs; // List of order IDs associated with this vendor
         address optionalPaymentReciever; // Optional address for payment receiver - if not recived will default to vendorAddress
-
+        bool approved;
     }
 
     
@@ -74,7 +74,7 @@ contract PoS is ReentrancyGuard, Ownable{
 
     mapping(uint256 => mapping (address => bool)) private  vendorApprovedAddresses; // Access control for vendor approved addresses
 
-    bool gateVendors = false;
+    bool approvalsNecessary = false;
 
     address feeAddress; // Address to receive fees for creating orders 
     AggregatorV3Interface internal CBETHtoUSD;
@@ -98,6 +98,13 @@ contract PoS is ReentrancyGuard, Ownable{
         _;
     }
 
+    modifier requireApprovedVendor(uint256 vendorID) {
+        if (approvalsNecessary) {
+            require(vendors[vendorID].approved, "Vendor is not approved");
+        }
+        _;
+    }
+
 
 
 
@@ -117,9 +124,7 @@ contract PoS is ReentrancyGuard, Ownable{
         require(!vendor.isActive, "Vendor already exists");
         vendor.name = name;
         vendor.vendorAddress = msg.sender; // Vendor’s payout address
-        if (!gateVendors){
-            vendor.isActive = true;
-        }
+        vendor.isActive = true;
         vendorList.push(vendorCounter);
         vendorIndex[vendorCounter] = vendorList.length - 1;
         vendorCounter++;
@@ -128,7 +133,7 @@ contract PoS is ReentrancyGuard, Ownable{
     }
 
     function deActivateVendor(uint256 vendorID) external activeVendor(vendorID) {
-        require(msg.sender == vendors[vendorID].vendorAddress || approvedAddresses[msg.sender], "Only the vendor or tg address can deactivate");
+        require(msg.sender == vendors[vendorID].vendorAddress, "Only the vendor can deactivate");
         uint256 _index = vendorIndex[vendorID];
         uint256 lastVendorID = vendorList[vendorList.length - 1];
         if (_index != vendorList.length - 1) {
@@ -140,9 +145,9 @@ contract PoS is ReentrancyGuard, Ownable{
         delete vendorIndex[vendorID];
     }
 
-    function activateVendor(uint256 vendorID) external{
+    function activateVendor(uint256 vendorID) external {
         require(!vendors[vendorID].isActive, "Vendor already exists");
-        require(msg.sender == vendors[vendorID].vendorAddress || approvedAddresses[msg.sender] , "You do not own this vendor");
+        require(msg.sender == vendors[vendorID].vendorAddress, "You do not own this vendor");
         vendors[vendorID].isActive = true;
         vendorList.push(vendorID);
         vendorIndex[vendorID] = vendorList.length - 1;
@@ -175,7 +180,7 @@ contract PoS is ReentrancyGuard, Ownable{
 
 
     // --- Order Management ---
-    function createOrder(uint256 _vendorId, uint256 _amount, string memory _vendorOrderId) external activeVendor(_vendorId) approvedOrderCreators(_vendorId) returns (uint256 orderId) {
+    function createOrder(uint256 _vendorId, uint256 _amount, string memory _vendorOrderId) external activeVendor(_vendorId) approvedOrderCreators(_vendorId) requireApprovedVendor(_vendorId) returns (uint256 orderId) {
         uint256 withholding;
 
         if (approvedAddresses[msg.sender]) {
@@ -432,8 +437,8 @@ contract PoS is ReentrancyGuard, Ownable{
         return results;
     }
 
-    function setgateVendors() external onlyOwner {
-        gateVendors = !gateVendors;
+    function setApprovalsNecessary () external onlyOwner {
+        approvalsNecessary = !approvalsNecessary;
     }
 
 
