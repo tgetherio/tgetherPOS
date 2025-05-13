@@ -261,7 +261,8 @@ contract PoS is ReentrancyGuard, Ownable{
         uint256 vendorAmount = _amount - feeToTake;
 
         // Transfers
-        require(USDCcontract.transferFrom(msg.sender, recipient, vendorAmount), "USDC transfer to vendor failed");
+        require(USDCcontract.transferFrom(msg.sender, address(this), _amount), "USDC transfer to this contract failed");
+        require(USDCcontract.transfer(recipient, vendorAmount), "USDC transfer to vendor failed");
 
         if (feeToTake > 0) {
             require(feeAddress != address(0), "Fee address not set");
