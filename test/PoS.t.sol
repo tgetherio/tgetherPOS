@@ -10,6 +10,7 @@ contract RefundCaller {
     }
 }
 
+
 contract PoSTest is Test {
     PoS public pos;
 
@@ -18,12 +19,12 @@ contract PoSTest is Test {
     address public user3 = address(0x3);
 
     MockUSDC public mockUSDC;
-    MockOracle public mockOracle;
+    bytes  emptySig = "";
+    PoS.OrderAuth  emptyAuth = PoS.OrderAuth(0, "", 0, 0, "");
 
     function setUp() public {
         mockUSDC = new MockUSDC();
-        mockOracle = new MockOracle();
-        pos = new PoS(address(mockOracle), address(mockUSDC));
+        pos = new PoS(address(mockUSDC));
     }
 
     function testCreateAndPayOrder() public {
@@ -45,9 +46,9 @@ contract PoSTest is Test {
         uint256 orderId = pos.createOrder(1, 300e6, "ORDER_X");
 
         // Pay order
-        vm.prank(user1); pos.pay(orderId, address(0), 0, 100e6);
-        vm.prank(user2); pos.pay(orderId, address(0), 0, 100e6);
-        vm.prank(user3); pos.pay(orderId, address(0), 0, 100e6);
+        vm.prank(user1); pos.pay(orderId, address(0), 0, 100e6, emptySig, emptyAuth);
+        vm.prank(user2); pos.pay(orderId, address(0), 0, 100e6,  emptySig, emptyAuth);
+        vm.prank(user3); pos.pay(orderId, address(0), 0, 100e6,  emptySig, emptyAuth);
 
         // Assert final state
         (uint256 total, uint256 collected, bool processed, uint256 numPayers) = pos.getOrderDetails(orderId);
@@ -74,9 +75,9 @@ contract PoSTest is Test {
         pos.createVendor("TestVendor");
         // Create and pay an order
         uint256 orderId = pos.createOrder(1, 300e6, "ORDER_X");
-        vm.prank(user1); pos.pay(orderId, address(0), 0, 100e6);
-        vm.prank(user2); pos.pay(orderId, address(0), 0, 100e6);
-        vm.prank(user3); pos.pay(orderId, address(0), 0, 100e6);
+        vm.prank(user1); pos.pay(orderId, address(0), 0, 100e6,  emptySig, emptyAuth );
+        vm.prank(user2); pos.pay(orderId, address(0), 0, 100e6,  emptySig, emptyAuth);
+        vm.prank(user3); pos.pay(orderId, address(0), 0, 100e6,  emptySig, emptyAuth );
 
         // Perform refund via a separate contract
         mockUSDC.approve(address(pos), 300e6);
@@ -87,6 +88,61 @@ contract PoSTest is Test {
         for (uint i = 0; i < contribs.length; i++) {
             assertEq(contribs[i].amount, contribs[i].amountRefunded);
         }
+    }
+
+    function testPayWithSignatureCreatesOrder() public {
+        pos.approveAddress(address(this));
+        uint256 vendorId = pos.createVendor("SignedVendor");
+
+        uint256 validUntil = block.timestamp + 1 days;
+
+        PoS.OrderAuth memory auth = PoS.OrderAuth({
+            vendorId: vendorId,
+            vendorOrderId: "SIGNED_ORDER",
+            totalAmount: 150e6,
+            validUntil: validUntil,
+            nonce: "unique-nonce"
+        });
+
+        bytes32 domainSeparator = keccak256(abi.encode(
+            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+            keccak256(bytes("TgetherPOS")),
+            keccak256(bytes("1")),
+            block.chainid,
+            address(pos)
+        ));
+
+        bytes32 structHash = keccak256(abi.encode(
+            keccak256("OrderAuth(uint256 vendorId,string vendorOrderId,uint256 totalAmount,uint256 validUntil,string nonce)"),
+            vendorId,
+            keccak256(bytes("SIGNED_ORDER")),
+            150e6,
+            validUntil,
+            keccak256(bytes("unique-nonce"))
+        ));
+
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        uint256 privateKey = 0xA11CE;
+
+        pos.approveVendorAddress(vendorId, vm.addr(privateKey));
+        
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        bytes memory signature = abi.encodePacked(r, s, v);
+
+        mockUSDC.mint(user1, 1_000e6);
+        vm.prank(user1);
+        mockUSDC.approve(address(pos), type(uint256).max);
+
+        vm.prank(user1);
+        pos.pay(0, address(0), 0, 150e6, signature, auth);
+
+        uint256 newOrderId = pos.vendorOrderIDtoTgether(vendorId, "SIGNED_ORDER");
+        (uint256 total, uint256 collected, bool processed, uint256 numPayers) = pos.getOrderDetails(newOrderId);
+
+        assertEq(total, 150e6);
+        assertEq(collected, 150e6);
+        assertTrue(processed);
+        assertEq(numPayers, 1);
     }
 }
 
@@ -135,31 +191,5 @@ contract MockUSDC is IERC20 {
 
     function decimals() external pure returns (uint8) {
         return 6;
-    }
-}
-
-contract MockOracle is AggregatorV3Interface {
-    function latestRoundData() external pure override returns (
-        uint80, int256 answer, uint256, uint256, uint80
-    ) {
-        return (0, 2_000e8, 0, 0, 0); // 1 ETH = $2000
-    }
-
-    function decimals() external pure override returns (uint8) {
-        return 8;
-    }
-
-    function description() external pure override returns (string memory) {
-        return "Mock Oracle";
-    }
-
-    function version() external pure override returns (uint256) {
-        return 1;
-    }
-
-    function getRoundData(uint80) external pure override returns (
-        uint80, int256, uint256, uint256, uint80
-    ) {
-        revert("not implemented");
     }
 }

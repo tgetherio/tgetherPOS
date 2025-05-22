@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
-pragma solidity ^0.8.28;
+pragma solidity ^0.8.24;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
-import {AggregatorV3Interface} from "@chainlink/contracts/src/v0.8/shared/interfaces/AggregatorV3Interface.sol";
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 
 interface IPOSBase {
@@ -24,6 +23,15 @@ contract PoS is ReentrancyGuard, Ownable{
         FULL
     }
 
+    struct OrderAuth {
+    uint256 vendorId;
+    string vendorOrderId;
+    uint256 totalAmount;
+    uint256 validUntil;
+    string nonce;
+    }
+
+
 
     // --- Storage Structures ---
     struct Contribution {
@@ -41,9 +49,8 @@ contract PoS is ReentrancyGuard, Ownable{
         bytes32[] contributionKeys;
         uint256 amtRefunded;       // Amount refunded
         RefundType refundType;     // Refund type (NONE, PARTIAL, FULL)
-        uint256 amtToWithhold;       // Amount withhold for gas fees
-        uint256 withheldSoFar;       // Flag to indicate if the amount has been withheld
         bool processed; // Flag to indicate if the order has been processed
+        uint256 timestamp;
     }
 
     struct Vendor {
@@ -71,23 +78,23 @@ contract PoS is ReentrancyGuard, Ownable{
     mapping(uint256 => uint256) public OrderVendor; // Maps orderId to vendorId
     mapping(address => uint256[]) public addressToOrderID; //Maps Address to Orders they are apart of
     mapping(uint256=> mapping(string => uint256)) public vendorOrderIDtoTgether; //Mapps a vendor's orderID to its tgether orderId
-    
-    mapping(uint256 => uint256) public vendorWithholdingDebt; // vendorID → unpaid withholding total
-
-    uint256 public defaultWithholdingAllotment = 10e6; // e.g. 10 USDC (adjustable by owner)
-
 
     mapping(uint256 => mapping (address => bool)) private  vendorApprovedAddresses; // Access control for vendor approved addresses
 
+
+
+    bytes32 private constant ORDER_TYPEHASH = keccak256(
+    "OrderAuth(uint256 vendorId,string vendorOrderId,uint256 totalAmount,uint256 validUntil,string nonce)"
+    );
+
+    bytes32 private DOMAIN_SEPARATOR;
+
+
     bool approvalsNecessary = false;
 
-    address feeAddress; // Address to receive fees for creating orders 
-    AggregatorV3Interface internal CBETHtoUSD;
     IERC20 USDCcontract;   //Address to estimate withholdings in USDC
     address public posBase; // address of CCIP POSBase
 
-    uint256 public estimatedOrderGas = 185000; // can be updated by owner
-    uint256 public feeMultiplierBps = 150; // Fee on gas for managed order creation
 
     // --- Modifiers ---
     // restricts function access to approved addresses
@@ -114,11 +121,25 @@ contract PoS is ReentrancyGuard, Ownable{
 
 
     // --- Constructor ---
-    constructor(address _CBETHtoUSD, address _USDCcontract) Ownable(msg.sender){
+    constructor(address _USDCcontract) Ownable(msg.sender){
         // Initialize the contract deployer as an approved address
         approvedAddresses[msg.sender] = true;
-        CBETHtoUSD = AggregatorV3Interface(_CBETHtoUSD);
         USDCcontract = IERC20(_USDCcontract);
+
+        uint256 chainId;
+        assembly {
+            chainId := chainid()
+        }
+
+        DOMAIN_SEPARATOR = keccak256(
+            abi.encode(
+                keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+                keccak256(bytes("TgetherPOS")),
+                keccak256(bytes("1")),
+                chainId,
+                address(this)
+            )
+        );
 
     }
 
@@ -132,7 +153,6 @@ contract PoS is ReentrancyGuard, Ownable{
         vendor.isActive = true;
         vendorList.push(vendorCounter);
         vendorIndex[vendorCounter] = vendorList.length - 1;
-        vendor.withholdingAllotment = defaultWithholdingAllotment; // Set default withholding allotment
         vendorCounter++;
         return vendorCounter - 1; // Return the vendor ID
 
@@ -178,73 +198,30 @@ contract PoS is ReentrancyGuard, Ownable{
     function setVendorPaymentReciever(
         uint256 vendorID,
         address addr
-    ) external activeVendor(vendorID) {
+    ) external {
        require(msg.sender == vendors[vendorID].vendorAddress, "Only the vendor can approve addresses");
         vendors[vendorID].optionalPaymentReciever = addr;
     }
-
-    function payWithholding(uint256 vendorID, uint256 amount) external nonReentrant {
-        require(vendorApprovedAddresses[vendorID][msg.sender], "Can not pay withholding");
-        require(vendorWithholdingDebt[vendorID] > 0, "No withholding owed");
-
-        require(USDCcontract.transferFrom(msg.sender, feeAddress, amount), "Payment failed");
-
-        if (amount >= vendorWithholdingDebt[vendorID]) {
-            vendorWithholdingDebt[vendorID] = 0;
-        } else {
-            vendorWithholdingDebt[vendorID] -= amount;
-        }
-        emit WithholdingPaid(vendorID, amount, vendorWithholdingDebt[vendorID]);
-    }
-
     // --- Order Management ---
     function createOrder(uint256 _vendorId, uint256 _amount, string memory _vendorOrderId) external activeVendor(_vendorId) approvedOrderCreators(_vendorId) requireApprovedVendor(_vendorId) returns (uint256 orderId) {
-        uint256 withholding;
-
-        if (approvedAddresses[msg.sender]) {
-            (
-                /* uint80 roundId */,
-                int256 conversion,
-                /*uint256 startedAt*/,
-                /*uint256 updatedAt*/,
-                /*uint80 answeredInRound*/
-            ) = CBETHtoUSD.latestRoundData();
-
-            require(conversion > 0, "Invalid price feed");
-            withholding = (uint256(conversion) * tx.gasprice * estimatedOrderGas * feeMultiplierBps) / (1e18 * 100);
-
-            vendorWithholdingDebt[_vendorId] += withholding;
-            require(vendorWithholdingDebt[_vendorId] <= vendors[_vendorId].withholdingAllotment, "Unpaid withholding limit reached");
-
-        } else if (vendorApprovedAddresses[_vendorId][msg.sender]) {
-            withholding = 0;
-        } else {
-            revert("Not an approved address");
-        }
-
         // Create a new order
         Order storage order = orders[orderCounter];
-        order.totalAmount = _amount; // Set the total amount to 0 initially
-        order.amtToWithhold = withholding; // Set the amount to withhold
+
         vendors[_vendorId].orderIDs.push(orderCounter);
 
         OrderVendor[orderCounter] = _vendorId; // Map the order ID to the vendor ID
+        order.totalAmount = _amount; // Set the total amount for the order
+        order.timestamp = block.timestamp;
 
         if (bytes(_vendorOrderId).length > 0) {
             vendorOrderIDtoTgether[_vendorId][_vendorOrderId] = orderCounter;
             order.vendorOrderId = _vendorOrderId; // Set the vendor-specific order ID
         }
-
-
         orderCounter++;
 
-
         // Emit an event for the order creation
-        emit OrderCreated(orderCounter - 1, _vendorOrderId, _vendorId, _amount, withholding);
-
-        
+        emit OrderCreated(orderCounter - 1, _vendorOrderId, _vendorId, _amount);
         return orderCounter - 1; // Return the order ID
-
 
     }
 
@@ -254,9 +231,34 @@ contract PoS is ReentrancyGuard, Ownable{
         uint256 _orderID,
         address _payer,
         uint256 _payerChain,
-        uint256 _amount
-    ) external nonReentrant {
-        require(orders[_orderID].totalAmount > 0, "Order does not exist");
+        uint256 _amount,
+        bytes calldata signature,
+        OrderAuth calldata auth
+    ) external nonReentrant{
+
+        if (_orderID == 0) {
+            require(block.timestamp <= auth.validUntil, "Signature expired");
+            require(this.verifyOrderSignature(auth, signature), "Invalid vendor signature");
+
+            uint256 existing = vendorOrderIDtoTgether[auth.vendorId][auth.vendorOrderId];
+
+            if (existing == 0) {
+                Order storage _order = orders[orderCounter];
+                _order.vendorOrderId = auth.vendorOrderId;
+                _order.totalAmount = auth.totalAmount;
+                vendors[auth.vendorId].orderIDs.push(orderCounter);
+                OrderVendor[orderCounter] = auth.vendorId;
+                vendorOrderIDtoTgether[auth.vendorId][auth.vendorOrderId] = orderCounter;
+                _orderID = orderCounter;
+                _order.timestamp = block.timestamp;
+
+                orderCounter++;
+
+                emit OrderCreated(_orderID, auth.vendorOrderId, auth.vendorId, auth.totalAmount);
+            } else {
+                _orderID = existing;
+            }
+        }
 
         Order storage order = orders[_orderID];
 
@@ -280,29 +282,9 @@ contract PoS is ReentrancyGuard, Ownable{
         Vendor storage v = vendors[vendorID];
         address recipient = v.optionalPaymentReciever == address(0) ? v.vendorAddress : v.optionalPaymentReciever;
 
-        // Handle fees
-        uint256 feeToTake = 0;
-        if (order.amtToWithhold > 0 && order.withheldSoFar < order.amtToWithhold) {
-            uint256 remainingToWithhold = order.amtToWithhold - order.withheldSoFar;
-            feeToTake = (_amount <= remainingToWithhold) ? _amount : remainingToWithhold;
-            order.withheldSoFar += feeToTake;
-        }
-
-        uint256 vendorAmount = _amount - feeToTake;
-
         // Transfers
         require(USDCcontract.transferFrom(msg.sender, address(this), _amount), "USDC transfer to this contract failed");
-        require(USDCcontract.transfer(recipient, vendorAmount), "USDC transfer to vendor failed");
-
-        if (feeToTake > 0) {
-            require(feeAddress != address(0), "Fee address not set");
-            require(USDCcontract.transfer(feeAddress, feeToTake), "USDC fee transfer failed");
-            if (feeToTake >= vendorWithholdingDebt[vendorID]) {
-                vendorWithholdingDebt[vendorID] = 0;
-            } else {
-                vendorWithholdingDebt[vendorID] -= feeToTake;
-            }
-        }
+        require(USDCcontract.transfer(recipient, _amount), "USDC transfer to vendor failed");
 
         if (order.currentAmount >= order.totalAmount) {
             order.processed = true;
@@ -379,7 +361,44 @@ contract PoS is ReentrancyGuard, Ownable{
     // --- Internal Functions --- 
     function getContributionKey(address payer, uint256 chainID) internal pure returns (bytes32) {
     return keccak256(abi.encodePacked(payer, chainID));
-}
+    }
+
+    function verifyOrderSignature(OrderAuth memory order, bytes memory signature) external view returns (bool) {
+        bytes32 structHash = keccak256(abi.encode(
+            ORDER_TYPEHASH,
+            order.vendorId,
+            keccak256(bytes(order.vendorOrderId)),
+            order.totalAmount,
+            order.validUntil,
+            keccak256(bytes(order.nonce))
+        ));
+
+        bytes32 digest = keccak256(abi.encodePacked(
+            "\x19\x01",
+            DOMAIN_SEPARATOR,
+            structHash
+        ));
+        address signer = recover(digest, signature);
+
+        return (vendorApprovedAddresses[order.vendorId][signer] || approvedAddresses[signer]);
+    }
+
+    function recover(bytes32 digest, bytes memory signature) internal pure returns (address) {
+        require(signature.length == 65, "Invalid signature length");
+
+        bytes32 r;
+        bytes32 s;
+        uint8 v;
+
+        assembly {
+            r := mload(add(signature, 32))
+            s := mload(add(signature, 64))
+            v := byte(0, mload(add(signature, 96)))
+        }
+
+        return ecrecover(digest, v, r, s);
+    }
+
 
     // --- Admin Functions ---
     function approveAddress(address addr) external onlyOwner {
@@ -389,45 +408,13 @@ contract PoS is ReentrancyGuard, Ownable{
     function removeApprovedAddress(address addr) external onlyOwner {
         approvedAddresses[addr] = false;
     }
-    function setFeeAddress(address _feeAddress) external onlyOwner {
-    require(_feeAddress != address(0), "Cannot set zero address");
-    feeAddress = _feeAddress;
-    }
-
 
     function setPOSBase(address _posBase) external onlyOwner {
         posBase = _posBase;
     }
 
-
-    function setFeeAndGas(uint256 _feeMultiplierBps, uint256 _estimatedOrderGas) external onlyOwner {
-        require(_feeMultiplierBps >= 100, "Multiplier must be >= 100");
-        require(_estimatedOrderGas > 0, "Gas estimate must be > 0");
-        feeMultiplierBps = _feeMultiplierBps;
-        estimatedOrderGas = _estimatedOrderGas;
-    }
-
-    function setFeeMultiplier(uint256 _bps) external onlyOwner {
-        require(_bps >= 100, "Must be >= 1x");
-        feeMultiplierBps = _bps;
-    }
-
-    function setEstimatedOrderGas(uint256 gas) external onlyOwner {
-        require(gas > 0, "Invalid gas amount");
-        estimatedOrderGas = gas;
-    }
     function setApprovalsNecessary () external onlyOwner {
         approvalsNecessary = !approvalsNecessary;
-    }
-
-
-
-    function setVendorwithholdingAllotment(uint256 vendorID, uint256 allotment) external onlyOwner {
-        vendors[vendorID].withholdingAllotment = allotment;
-    }
-
-    function setDefaultWithholdingAllotment(uint256 amount) external onlyOwner {
-        defaultWithholdingAllotment = amount;
     }
 
 
@@ -484,7 +471,7 @@ contract PoS is ReentrancyGuard, Ownable{
 
 
     // --- Events ---
-    event OrderCreated(uint256 indexed orderId, string indexed vendorOrderId,  uint256 indexed vendorId, uint256 amount, uint256 withholding);
+    event OrderCreated(uint256 indexed orderId, string indexed vendorOrderId,  uint256 indexed vendorId, uint256 amount);
 
     event ContributionReceived(uint256 orderID, address payer, uint256 chainID, uint256 amount, uint256 vendor);
 

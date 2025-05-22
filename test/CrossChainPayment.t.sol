@@ -7,7 +7,7 @@ import {
 } from "lib/chainlink-local/src/ccip/CCIPLocalSimulator.sol";
 import {POSBase} from "src/POSBase.sol"; 
 import {POSMember} from "src/POSMember.sol"; 
-import {MOCKERC20POS} from "src/MOCKERC20POS.sol";
+import "../src/PoS.sol"; // Adjust path if needed
 import {WETH9} from "lib/chainlink-local/src/shared/WETH9.sol";
 import {LinkToken} from "lib/chainlink-local/src/shared/LinkToken.sol";
 import {console} from "lib/forge-std/src/Test.sol";
@@ -16,10 +16,15 @@ contract CrossChainPayment is Test {
     CCIPLocalSimulator public ccipLocalSimulator;
     POSBase public base;
     POSMember public member;
-    MOCKERC20POS public mockPay;
+
+    PoS public pos;
 
     uint64 public destinationChainSelector;
     BurnMintERC677Helper public ccipUSDCToken;
+
+    bytes emptySig = "";
+    POSMember.OrderAuth  emptyAuth = POSMember.OrderAuth(0, "", 0, 0, "");
+    address recieveAddress = address(0x1);
 
     /**
      * @notice Sets up the test environment by initializing the CCIP simulator and deploying contracts.
@@ -31,19 +36,24 @@ contract CrossChainPayment is Test {
         (uint64 chainSelector, IRouterClient sourceRouter, IRouterClient destinationRouter_, , ,
             BurnMintERC677Helper ccipUSDC,) = ccipLocalSimulator.configuration();
 
+        pos = new PoS(address(ccipUSDC));
+        
+        pos.approveAddress(address(this)); 
+        pos.createVendor("TestVendor");
+        pos.setVendorPaymentReciever(1, recieveAddress);
+        pos.approveVendorAddress(1, recieveAddress);
+        uint256 orderId = pos.createOrder(1, 300e6, "ORDER_X");
+
         destinationChainSelector = chainSelector;
 
         ccipUSDCToken= ccipUSDC;
 
-        // Deploy mock payment token
-        mockPay = new MOCKERC20POS(address(ccipUSDCToken), chainSelector);
-
         // Deploy base and member contracts
-        base = new POSBase(address(destinationRouter_), address(ccipUSDCToken), address(mockPay));
+        base = new POSBase(address(destinationRouter_), address(ccipUSDCToken), address(pos));
         member = new POSMember(address(sourceRouter), address(ccipUSDCToken), chainSelector, address(base));
 
         base.setApprovedChain(block.chainid, address(member), destinationChainSelector);
-        mockPay.setCrossChainSender(address(base));
+        pos.setPOSBase(address(base));
     }
 
     /**
@@ -72,11 +82,11 @@ contract CrossChainPayment is Test {
         // Perform cross-chain payment
         uint256 orderID = 1;
         uint256 amount = 1;
-        member.sendPayment(orderID, amount);
+        member.sendPayment(orderID, amount, emptySig, emptyAuth);
 
         // Expect payment to be received by POSBase
-        uint256 mockContractBalance = ccipUSDCToken.balanceOf(address(mockPay));
-        assertEq(mockContractBalance, amount, "Mock contract should have received 1 USDC");
+        uint256 recieveAddressBalance = ccipUSDCToken.balanceOf(recieveAddress);
+        assertEq(recieveAddressBalance, amount, "Recieve Address should have received 1 USDC");
 
     }
 
@@ -84,16 +94,85 @@ contract CrossChainPayment is Test {
      * @notice Tests receiving a cross-chain refund.
      */
     function testReceiveRefund() public {
-        mintAndFund();
         uint256 orderID = 1;
         uint256 amount = 1;
 
         testSendPayment();
 
         // Perform refund
-        mockPay.refund(orderID, false);
+        vm.prank(recieveAddress);
+        ccipUSDCToken.approve(address(pos), amount);
+        vm.prank(recieveAddress);
+        pos.refundOrder(orderID);
+
+        uint256 thisBal = ccipUSDCToken.balanceOf(address(this));
+        uint256 recieveAddressBalance = ccipUSDCToken.balanceOf(recieveAddress);
+        assertEq(thisBal, 1e18, "This Contract should have received 1 USDC");
+        assertEq(recieveAddressBalance, 0, "Recieve Address should have received 1 USDC");
+
 
         // Expect refund to be issued to the payer
         emit POSMember.RefundReceived(address(this), amount, orderID);
     }
+
+
+    function testSendPaymentWithOrderAuth() public {
+        mintAndFund();
+
+        // Approve USDC transfer to member contract
+        uint256 vendorId = pos.createVendor("SignedVendor");
+
+        uint256 validUntil = block.timestamp + 1 days;
+
+        POSMember.OrderAuth memory auth = POSMember.OrderAuth({
+            vendorId: vendorId,
+            vendorOrderId: "SIGNED_ORDER",
+            totalAmount: 150e6,
+            validUntil: validUntil,
+            nonce: "unique-nonce"
+        });
+
+        bytes32 domainSeparator = keccak256(abi.encode(
+            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"),
+            keccak256(bytes("TgetherPOS")),
+            keccak256(bytes("1")),
+            block.chainid,
+            address(pos)
+        ));
+
+        bytes32 structHash = keccak256(abi.encode(
+            keccak256("OrderAuth(uint256 vendorId,string vendorOrderId,uint256 totalAmount,uint256 validUntil,string nonce)"),
+            vendorId,
+            keccak256(bytes("SIGNED_ORDER")),
+            150e6,
+            validUntil,
+            keccak256(bytes("unique-nonce"))
+        ));
+
+        bytes32 digest = keccak256(abi.encodePacked("\x19\x01", domainSeparator, structHash));
+        uint256 privateKey = 0xA11CE;
+        pos.setVendorPaymentReciever(2, recieveAddress);
+
+        pos.approveVendorAddress(2, vm.addr(privateKey));
+        
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(privateKey, digest);
+        bytes memory signature = abi.encodePacked(r, s, v);
+
+
+        ccipUSDCToken.approve(address(member), 150000000);
+
+        // Perform cross-chain payment
+        uint256 orderID = 0;
+        uint256 amount = 150000000;
+        member.sendPayment(orderID, amount, signature, auth);
+
+        // Expect payment to be received by POSBase
+        uint256 recieveAddressBalance = ccipUSDCToken.balanceOf(recieveAddress);
+        assertEq(recieveAddressBalance, 150e6, "Recieve Address should have received 1 USDC");
+
+    }
+
+
+
+
 }

@@ -18,6 +18,14 @@ contract POSMember is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
     error DestinationChainNotAllowlisted(uint64 destinationChainSelector);
     error InvalidReceiverAddress();
 
+    struct OrderAuth {
+    uint256 vendorId;
+    string vendorOrderId;
+    uint256 totalAmount;
+    uint256 validUntil;
+    string nonce;
+    }
+
     // Event emitted when a payment is sent cross-chain
     event PaymentSent(
         bytes32 indexed messageId,
@@ -76,7 +84,9 @@ contract POSMember is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
      */
     function sendPayment(
         uint256 orderID,
-        uint256 amount
+        uint256 amount,
+        bytes calldata signature,
+        OrderAuth calldata auth
     ) external nonReentrant returns (bytes32 messageId) {
         Client.EVMTokenAmount ;
 
@@ -92,11 +102,11 @@ contract POSMember is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
 
         Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
             receiver: abi.encode(baseReceiverContract), // ABI-encoded receiver address
-            data: abi.encode(msg.sender, block.chainid, orderID, amount), // ABI-encoded string message
+            data: abi.encode(msg.sender, block.chainid, orderID, amount, signature, auth), // ABI-encoded string message
             tokenAmounts: tokenAmounts, // Tokens amounts
             extraArgs: Client._argsToBytes(
                 Client.EVMExtraArgsV1({
-                    gasLimit: 200_000
+                    gasLimit: 800_000
                 })
             ),
             feeToken: address(0) // Setting feeToken to zero address, indicating native asset will be used for fees

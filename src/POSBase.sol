@@ -12,13 +12,26 @@ import {SafeERC20} from "@chainlink/contracts-ccip/src/v0.8/vendor/openzeppelin-
 import {console} from "lib/forge-std/src/Test.sol";// POSMember contract handles cross-chain payments and refunds using Chainlink CCIP
 
 // Interface for the external payment handler contract that handles final payment processing.
+
+struct OrderAuth {
+        uint256 vendorId;
+        string vendorOrderId;
+        uint256 totalAmount;
+        uint256 validUntil;
+        string nonce;
+        }
+        
 interface IPaymentHandler {
     function pay(
         uint256 orderID,
-        address payAs,
-        uint256 payAsChain,
-        uint256 amount
+        address payer,
+        uint256 payerChain,
+        uint256 amount,
+        bytes calldata signature,
+        OrderAuth calldata auth
     ) external;
+
+    function verifyOrderSignature(OrderAuth memory order, bytes memory signature) external view returns (bool);
 }
 
 // Main Point of Sale (POS) contract for handling cross-chain payments via Chainlink CCIP.
@@ -34,8 +47,8 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
     event PaymentSent(
         bytes32 indexed messageId,
         uint64 indexed destinationChainSelector,
-        address indexed payAs,
-        uint256 payAsChain,
+        address indexed payer,
+        uint256 payerChain,
         address token,
         uint256 amount,
         uint256 fees
@@ -44,8 +57,8 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
     // Event emitted when a payment is received from another chain
     event PaymentReceived(
         uint256 orderID,
-        address payAs,
-        uint256 payAsChain,
+        address payer,
+        uint256 payerChain,
         address token,
         uint256 amount
     );
@@ -115,7 +128,7 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
             data: data,
             tokenAmounts: tokenAmounts,
             extraArgs: Client._argsToBytes(
-                Client.EVMExtraArgsV1({gasLimit: 400_000})
+                Client.EVMExtraArgsV1({gasLimit: 800_000})
             ),
             feeToken: address(0) // Native gas fees
         });
@@ -142,10 +155,15 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
      * @param message The received CCIP message containing payment details.
      */
     function _ccipReceive(Client.Any2EVMMessage memory message) internal override nonReentrant {
-        (address payAs, uint256 payAsChain, uint256 orderID,) = abi.decode(
-            message.data,
-            (address, uint256, uint256, uint256)
-        );
+        (address payer, uint256 payerChain, uint256 orderID, uint256 _amount, bytes memory signature, OrderAuth memory auth) =
+            abi.decode(message.data, (address, uint256, uint256, uint256, bytes, OrderAuth));
+
+
+        // Check if we are creating an order that it is has legitamite values
+        if(orderID == 0){
+            require(auth.vendorId != 0 && auth.totalAmount > 0 && block.timestamp <= auth.validUntil , "Invalid order ID");
+            require(paymentHandler.verifyOrderSignature(auth, signature), "Invalid vendor signature");
+        }
 
         require(message.destTokenAmounts.length == 1, "Invalid token amount");
 
@@ -153,14 +171,14 @@ contract POSBase is CCIPReceiver, OwnerIsCreator, ReentrancyGuard {
         address token = message.destTokenAmounts[0].token;
 
         if (token != address(usdcToken)) {
-            emit WrongERC20PaymentRecieved(token, amount, payAs, payAsChain);
+            emit WrongERC20PaymentRecieved(token, amount, payer, payerChain);
             revert InvalidTokenAddress();
         }
 
         usdcToken.safeIncreaseAllowance(address(paymentHandler), amount);
-        paymentHandler.pay(orderID, payAs, payAsChain, amount);
+        paymentHandler.pay(orderID, payer, payerChain, amount, signature, auth );
 
-        emit PaymentReceived(orderID, payAs, payAsChain, address(usdcToken), amount);
+        emit PaymentReceived(orderID, payer, payerChain, address(usdcToken), amount);
     }
 
     // Allows the contract owner to set approved chain receivers and chain selectors
